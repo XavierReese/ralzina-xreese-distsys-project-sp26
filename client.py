@@ -264,9 +264,7 @@ def _handle_push(session: Session, message: bytes) -> None:
             print(f"[ERROR] Failed to extract results for job {job_id}: {exc}")
 
     elif tag == "OK":
-        # TODO: if this is a SUBMIT_JOB acknowledgement, parse the job_id and
-        #       call session.register_job(job_id, pending_out_dir) here once
-        #       the protocol format is finalised with your partner.
+        # TODO: call session.register_job(job_id, pending_out_dir) if this is a SUBMIT_JOB ack
         print(f"\n[OK] {' '.join(parts[1:])}")
 
     elif tag == "STATUS":

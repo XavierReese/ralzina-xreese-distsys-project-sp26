@@ -9,6 +9,16 @@ Once connected, worker sends initial registration with stats and worker_name
 and waits for acknowledgement from coordinator before continuien
 
 Worker listens to coordinator for job requests and runs each job.
+
+Design choices:
+- Worker will not always need an ack. Ack is when worker initiates convesration and needs ack.
+That is only needd during registration. After registration, coordinator contacts worker to
+send job and needs an ack from worker. When worker finishes job it sends result to coordinator
+and needs an ack. Since the ack is both ways, I decided to use a send_thread that sends messages.
+The worker will put message_id's and specify if it needs an ack when putting in send queue, and
+it will have a queue of internal acks with message id's that it's waiting for and if the worker
+receives a message from coordinator of type ack, then it will check off that ack and proceed with
+the final part of the operation.
 """
 
 import http.client
@@ -20,14 +30,19 @@ import os
 import shutil
 import threading
 import queue
+import subprocess
+import base64
+import zipfile
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 # Worker constants
-MAX_BACKOFF = 64
-BUFSIZ = 4096
+MAX_BACKOFF         = 64
+BUFSIZ              = 4096
+HEARTBEAT_INTERVAL  = 60
+MAX_LOG_COUNT       = 100
 
 # Catalog constant
 CATALOG_URL         = "catalog.cse.nd.edu"
@@ -55,28 +70,34 @@ class Worker:
     # ---------------------------------------------------------------------------
     def __init__(self, worker_name, coord_name, max_jobs):
         self.worker_name = worker_name
+        self.worker_dir = f"{self.worker_name}_dir"
+        self.worker_ckpt = f"{self.worker_name}.ckpt"
+        self.worker_log = f"{self.worker_name}.txn"
         self.coord_name = coord_name
-        self.coord_sock = None
+
+        self.main_sock = None
+        self.main_lock = threading.Lock() # need a lock to share with heartbeat thread
+        self.send_sock = None
+
         self.max_jobs = max_jobs
-        self.running_jobs = {}
+        self.running_jobs = []
+        self.jobs_lock = threading.Lock()
+
         self.log_count = 0
-        self.registered = False
-        self.send_lock = threading.Lock()
-        self.send_queue = queue.Queue()
 
         # Create worker directory
-        os.makedirs(f"{self.worker_name}", exist_ok=True)
+        os.makedirs(self.worker_dir, exist_ok=True)
 
-        if os.path.exists(f"{self.worker_name}.ckpt"):
-            with open(f"{self.worker_name}.ckpt", "r") as ckpt:
+        if os.path.exists(self.worker_ckpt):
+            with open(self.worker_ckpt, "r") as ckpt:
                 data = json.load(ckpt)
 
             for job, info in data.items():
                 self.running_jobs[job] = info
 
         # Apply everything listed on log file
-        if os.path.exists(f"{self.worker_name}.txn"):
-            with open(f"{self.worker_name}.txn", "r") as f:
+        if os.path.exists(self.worker_log):
+            with open(self.worker_log, "r") as f:
                 for line in f:
                     self.log_count += 1
                     if not line.strip():
@@ -91,50 +112,17 @@ class Worker:
                     elif status == "finished":
                         del self.running_jobs[job]
 
-        # Connect to coordinator and send computation stats
-        # Only send stats on startup, and after that start heartbeat thread
-        # This assumes that the coordinator will make sure to always remember the 
-        # past workers if there are any crashes
-        # If all workers would sent stats when coordinator came back up, the network
-        # could get overloaded
-
-        self.connect_to_coordinator()
-
-        # Retry until connected
-        while True:
-            # send heartbeat as registration
-            while not self.register():
-                self.connect_to_coordinator()
-
-            try:
-                # Receive registration ack
-                # If anything fails, restart connection to coordinator
-                length_bytes = self.recv_exact(4)
-                resp_len = int.from_bytes(length_bytes, "big")
-
-                resp_bytes = self.recv_exact(resp_len)
-                            
-                try:
-                    response = json.loads(resp_bytes.decode("utf-8"))
-                    
-                    if response["status"] == "failed":
-                        print("Registration failed")
-                    else:
-                        print(f"Registration with {self.coord_name} succeeded")
-                        self.registered = True
-                        break
-                except json.JSONDecodeError:
-                    print("Could not read response from server")
-
-            except Exception as e:
-                print(f"Worker error when registering: {e}")
-
-            self.connect_to_coordinator
+        # Create main and send socket and send registration for each
+        # main socket
+        self.start_sock(self.main_sock, "main_sock")
+        
+        # send socket
+        self.start_sock(self.send_sock, "send_sock")
 
         # Start heartbeat thread
         heartbeat_thread = threading.Thread(target=self.heartbeat, daemon=True)
         heartbeat_thread.start()
-        print("Worker heartbeat started")
+        print("Worker heartbeat thread started")
 
         # Start message sender thread
         send_thread = threading.Thread(target=self.send_thread, daemon=True)
@@ -143,18 +131,54 @@ class Worker:
 
         self.run()
 
-    def connect_to_coordinator(self):
+    def start_sock(self, sock, sock_type):
+        self.connect_to_coordinator(sock)
+
+        # Retry until connected
+        while True:
+            # send registration
+            while not self.register(sock, sock_type):
+                self.connect_to_coordinator(sock)
+
+            self.recv_ack(sock, sock_type)
+
+            self.connect_to_coordinator(sock)
+
+    def recv_ack(self, sock, sock_type):
+        try:
+            # Receive registration ack
+            # If anything fails, restart connection to coordinator
+            length_bytes = self.recv_exact(4, sock)
+            resp_len = int.from_bytes(length_bytes, "big")
+
+            resp_bytes = self.recv_exact(resp_len, sock)
+                            
+            try:
+                response = json.loads(resp_bytes.decode("utf-8"))
+                    
+                if response["status"] == "failed":
+                    print(f"{sock_type}: ack failed")
+                else:
+                    print(f"{sock_type}: ack to {self.coord_name} succeeded")
+                    return True
+            except json.JSONDecodeError:
+                print(f"{sock_type}: Could not read ack from coordinator")
+
+        except Exception as e:
+            print(f"{sock_type}: Worker error when receiving ack: {e}")
+
+        return False
+
+    def connect_to_coordinator(self, sock):
         print("Attempting to connect to coordinator")
 
-        with self.send_lock:
-            if self.coord_sock: 
-                self.coord_sock.close()
-            self.coord_sock = None
-
         # Connect to coordinator
-        # After connecting, coord_sock is the socket to talk to the coordinator
+        # After connecting, sock is the socket to talk to the coordinator
         backoff = 1
-        while not self.find_coordinator():
+        while True:
+            sock = self.find_coordinator() 
+            if sock is not None:
+                return
             if backoff >= MAX_BACKOFF:
                 print(f"Max backoff reached: {MAX_BACKOFF}. Quitting...")
                 sys.exit(1)
@@ -180,11 +204,11 @@ class Worker:
             
         except Exception:
             print(f"Worker for {self.coord_name} Could not contact catalog")
-            return False
+            return None
         
         if response.status != 200:
             print(f"[Worker for {self.coord_name} Could not contact catalog: HTTP error {response.status}")
-            return False
+            return None
         
         data = response.read()
         json_string = data.decode()
@@ -195,14 +219,14 @@ class Worker:
         matching_services = [
             (s["name"], s["port"], s["lastheardfrom"], s["coord_name"])
             for s in services
-            if ("type" in s and s["type"] == "coordinator") and ("coord_name" in s and s["coord_name"] == self.coord_name)
+            if ("type" in s and s["type"] == COORDINATOR_TYPE) and ("coord_name" in s and s["coord_name"] == self.coord_name)
         ]
 
         if matching_services:
             latest_service = max(matching_services, key=lambda x: x[2])
         else:
             print("Worker contacted name server but found no coordinator")
-            return False
+            return None
 
         # Section 2
         host, port = latest_service[0], latest_service[1]
@@ -216,47 +240,34 @@ class Worker:
                     
             new_sock.connect((host, port))
 
-            with self.send_lock:
-                self.coord_sock = new_sock
-
-            print(f"Worker for {self.coord_name} Connected")
-
-            return True
+            return new_sock
             
         except Exception as e:
             print(f"Worker for {self.coord_name} socket creation failed: {e}")
-            with self.send_lock:
-                if self.coord_sock: 
-                    self.coord_sock.close()
-                self.coord_sock = None
-            return False
+            return None
 
-    def register(self):
-        response = self.get_stats()
+    def register(self, sock, sock_type):
+        response = {
+            "sock_type": sock_type,
+            "type": "register"
+        }
 
         try:
             pre_response = json.dumps(response).encode("utf-8")
             response_length = len(pre_response).to_bytes(4, byteorder="big")
             final_response = response_length + pre_response
         except (TypeError, ValueError):
-            print(f"Worker Error: Couldn't serialize response to JSON")
+            print(f"{sock_type}: Couldn't serialize response to JSON")
             return False
 
         # Retry on failure
-        while True:
-            current_sock = self.coord_sock
+        try:
+            sock.sendall(final_response)
+            return True
+        except (socket.error, BrokenPipeError) as e:
+            print(f"{sock_type} Network Error: {e}")
                     
-            if current_sock is None:
-                print("Worker: Socket is None, reconnecting...")
-                return False
-
-            try:
-                self.coord_sock.sendall(final_response)
-                return True
-            except (socket.error, BrokenPipeError) as e:
-                print(f"Worker Network Error: {e}")
-                    
-                return False
+            return False
             
     # ---------------------------------------------------------------------------
     # Worker stats functions
@@ -267,7 +278,7 @@ class Worker:
     # ---------------------------------------------------------------------------
     def get_stats(self):
         stats =  {
-            "type": "heartbeat" if self.registered else "register",
+            "type": "heartbeat",
             "worker_name": self.worker_name,
             "cpu_load": self.cpu_load(),
             "free_main_mem_mb": self.free_main_mem_mb(),
@@ -315,8 +326,8 @@ class Worker:
         while True:
             # Get new message
             try:
-                # Read message
-                buffer = self.coord_sock.recv(BUFSIZ)
+                # Read message (blocks)
+                buffer = self.main_sock.recv(BUFSIZ)
                 data += buffer
             except ConnectionError:
                 data = b""
@@ -350,20 +361,108 @@ class Worker:
         Process a message
 
         Functions:
-        - Receive job request from coordinator
-        - Receive request to stop job from coordinator
+        - Receive job request from coordinator: process and send ack after
+        - Receive request to stop job from coordinator: process and send ack after
+        - Receive ack from coordinator: receive ack then resume final processing part
         """
         try:
             request = json.loads(message_bytes.decode("utf-8"))
-            
-            # Actual implementation
-        
         except (TypeError, ValueError):
             response = {
                 "status": "invalid",
                 "value": "Request is not valid JSON"
             }
-            self.send_queue.put(response)
+            with self.main_lock:
+                self.send_message(response)
+
+        # validate fields
+        if "method" not in request:
+            response = {
+                "status": "invalid",
+                "message": "Missing method"
+            }
+            with self.main_lock:
+                self.send_message(response)
+            return
+        
+        # Perform operation
+        match request["method"]:
+            # Job request
+            case "schedule":
+                if self.invalid_args(["zip", "job_id", "command_file"], request):
+                    return
+                
+                zip_data = base64.b64decode(request["zip"])
+                task_dir = f"{self.worker_dir}/{request["job_id"]}"
+                zip_path = f"{task_dir}/{request["job_id"]}.zip" # working environment zip file
+                
+                os.makedirs(task_dir, exist_ok=True)
+
+                with open(zip_path, "wb") as f:
+                    f.write(zip_data)
+
+                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                    zip_ref.extractall(task_dir)
+
+                bash_script = os.path.join(task_dir, request["command_file"])
+                os.chmod(bash_script, 0o755)
+
+                process = subprocess.Popen(
+                    ["bash", bash_script],
+                    cwd=task_dir
+                )
+
+                with self.jobs_lock:
+                    self.running_jobs[request["job_id"]] = process 
+
+                response = {
+                    "type": "ack",
+                    "status": "scheduled",
+                    "job_id": request["job_id"]
+                }
+            
+            # Stop job
+            case "stop":
+                if self.invalid_args(["job_id"], request):
+                    return
+                
+                job_id = request["job_id"]
+
+                with self.jobs_lock:
+                    process = self.running_jobs[job_id]
+
+                    print(f"Stopping job {job_id} from coordinator request")
+                    
+                    process.terminate()
+
+                    del self.running_jobs[job_id]
+
+                response = {
+                    "type": "ack",
+                    "status": "terminated",
+                    "job_id": job_id
+                }
+
+            case _:
+                response = {
+                    "status": "invalid",
+                    "message": "Invalid method requested"
+                }
+            
+        with self.main_lock:
+            self.send_message(response, self.main_sock)
+        
+    def invalid_args(self, args, request):
+        for arg in args:
+            if arg not in request:
+                response = {
+                    "status": "invalid",
+                    "message": f"invalid, {arg} not present"
+                }
+                with self.main_lock:
+                    self.send_message(response)
+                return True
+        return False
 
     # ---------------------------------------------------------------------------
     # Messaging Functions
@@ -371,55 +470,77 @@ class Worker:
     # - heartbeat: thread to send heartbeat to coordinator
     # - send_thread: thread that sends messages to coordinator from send_queue
     # ---------------------------------------------------------------------------
-    def recv_exact(self, bytes_len):
+    def recv_exact(self, bytes_len, sock):
         data = b""
         while len(data) < bytes_len:
-            chunk = self.coord_sock.recv(bytes_len - len(data))
+            chunk = sock.recv(bytes_len - len(data))
             if not chunk:
                 raise Exception("Socket closed while receiving data")
             data += chunk
         return data
-
+    
     def heartbeat(self):
+        with self.main_lock:
+            self.send_message(self.get_stats(), self.main_sock)
+
+        time.sleep(HEARTBEAT_INTERVAL)
+
+    def send_message(self, message, sock):
+        # send response
+        try:
+            pre_response = json.dumps(message).encode("utf-8")
+            response_length = len(pre_response).to_bytes(4, byteorder="big")
+            final_response = response_length + pre_response
+        except (TypeError, ValueError):
+            print(f"Worker Error: Couldn't serialize response to JSON")
+            return
+
+        # Retry on failure
         while True:
-            self.send_queue.put(self.get_stats())
-            time.sleep(60)
+            try:
+                sock.sendall(final_response)
+                break
+            except (socket.error, BrokenPipeError) as e:
+                print(f"Worker Network Error: {e}")
+                
+                self.start_sock(sock)
         
     def send_thread(self):
         """
         Send responses from queue
         """
         while True:
-            response = self.send_queue.get()
+            time.sleep(0.5)
 
-            try:
-                pre_response = json.dumps(response).encode("utf-8")
-                response_length = len(pre_response).to_bytes(4, byteorder="big")
-                final_response = response_length + pre_response
-            except (TypeError, ValueError):
-                print(f"Worker Error: Couldn't serialize response to JSON")
-                continue
+            with self.jobs_lock:
+                check_jobs = self.running_jobs.copy()
 
-            # Retry on failure
-            while True:
-                # We ONLY lock during the attempt to use the socket
-                with self.send_lock:
-                    current_sock = self.coord_sock
-                    
-                if current_sock is None:
-                    print("Worker: Socket is None, reconnecting...")
-                    self.connect_to_coordinator()
-                    continue
+                for job_id, job in check_jobs.items():
+                    exit_code = job.poll()
 
-                try:
-                    # Use the lock ONLY for the physical send
-                    with self.send_lock:
-                        self.coord_sock.sendall(final_response)
-                    break
-                except (socket.error, BrokenPipeError) as e:
-                    print(f"Worker Network Error: {e}")
-                    
-                    self.connect_to_coordinator()
+                    if exit_code is not None:
+                        stdout, stderr = job.communicate()
+
+                        message = {
+                            "type": "job output",
+                            "job_id": job_id,
+                            "stdout": stdout,
+                            "stderr": stderr,
+                            "exit_code": exit_code
+                        }
+
+                        # Send output
+                        self.send_message(message, self.send_sock)
+
+                        # Retry until we receive ack (idempotent)
+                        while not self.recv_ack(self.send_sock, "send_sock"):
+                            self.start_sock(self.send_sock, "send_sock")
+                            self.send_message(message, self.send_sock)
+
+                        # Remove job
+                        with self.jobs_lock:
+                            if job in self.running_jobs:
+                                del self.running_jobs[job_id]
 
 """
 
@@ -430,14 +551,16 @@ Worker checks name server for coordinator
 
 coordinator will register worker
 
-coordinator then polls workers to see their availability
-- coordinator knows worker is emptuy 
-- does coordinator have to ask every single worker?
-- should it just ask once?
+worker immediately sends heartbeat after startup and after that it sends it again every 
+HEARTBEAT_INTERVAL seconds
+
+That way workers only send heartbeats based on when they registered so that coordinator is never 
+overloaded
 
 Client talks to Coordinator and sends executable
-Coordinator talks to worker 
-
+Coordinator talks to worker and sends executable
+worker receives executable with bash script to run and runs it 
+worker sends result to coordinator when done
 """
 
 def main():

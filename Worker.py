@@ -5,20 +5,20 @@ Usage:
     python Worker.py <worker_name> <coord_name> <max_jobs>
 
 The coordinator is discovered automatically via the ND catalog service.
-Once connected, worker sends initial registration with stats and worker_name
-and waits for acknowledgement from coordinator before continuien
+Once connected, worker creates two socks and registers each sock separately with coordinator
+and waits for acknowledgement from coordinator before continuing
 
-Worker listens to coordinator for job requests and runs each job.
+Worker listens to coordinator for job requests, sends ack, and processes them
+
+Once jobs finish, worker contacts coordinator to notify of result (stdout & stderr) and waits for ack
 
 Design choices:
-- Worker will not always need an ack. Ack is when worker initiates convesration and needs ack.
-That is only needd during registration. After registration, coordinator contacts worker to
-send job and needs an ack from worker. When worker finishes job it sends result to coordinator
-and needs an ack. Since the ack is both ways, I decided to use a send_thread that sends messages.
-The worker will put message_id's and specify if it needs an ack when putting in send queue, and
-it will have a queue of internal acks with message id's that it's waiting for and if the worker
-receives a message from coordinator of type ack, then it will check off that ack and proceed with
-the final part of the operation.
+- Two sockets: Since there's times when worker initiates communication (send job resulst)
+and others when coordinator initiates communication (schedule new job), it's easier to
+have one socket for each type. Req_sock handles requests from coordinator and sends ack when request is processed.
+Res_sock handles sending job outputs to coordinator expecting an ack from coordinator.
+- Each socket is handled in a separate thread
+- The heartbeat thread shares the req_sock, so we must lock when using it to send only
 """
 
 import http.client
@@ -52,72 +52,48 @@ COORDINATOR_PROJECT = "dist_job_coordinator"
 
 # ---------------------------------------------------------------------------
 # Worker class
-# - Manages all functions to receive jbos and send results to coordinator
+# - Manages all functions to receive jobs and send results to coordinator
 # ---------------------------------------------------------------------------
 
 class Worker:
     # ---------------------------------------------------------------------------
     # Startup functions
     # - init:
-    #   - create or find worker directory
-    #   - load last checkpoint-log if it exists
+    #   - start with a fresh working directory
     #   - connect to coordinator, send registration and wait for ack
-    #   - startup heartbeat thread and sending thread
-    # - connect_to_coordinator: restarts socket and tries to connect to coordinator with backoff
+    #   - startup heartbeat thread and response thread
+    # - start_sock: handles all the logic to create a new socket from scratch
+    # - connect_to_coordinator: tries to connect to coordinator with backoff
     # - find_coordinator: contacts name server to find coordinator and returns True if it connected, False if not
-    # - register: specific function to send stats at the beginning of program.
-    #   - I couldn't use the send_thread since the thread starts until after registration
+    # - register: specific function to register a worker's socket
     # ---------------------------------------------------------------------------
     def __init__(self, worker_name, coord_name, max_jobs):
         self.worker_name = worker_name
         self.worker_dir = f"{self.worker_name}_dir"
-        self.worker_ckpt = f"{self.worker_name}.ckpt"
-        self.worker_log = f"{self.worker_name}.txn"
         self.coord_name = coord_name
 
-        self.main_sock = None
-        self.main_lock = threading.Lock() # need a lock to share with heartbeat thread
-        self.send_sock = None
+        self.req_sock = None
+        self.req_lock = threading.Lock() # need a lock to share with heartbeat thread
+        self.res_sock = None
 
         self.max_jobs = max_jobs
-        self.running_jobs = []
+        self.running_jobs = {}
         self.jobs_lock = threading.Lock()
 
-        self.log_count = 0
+        if os.path.exists(self.worker_dir):
+            print(f"Detected existing workspace. Cleaning up old data...")
+            # rm -rf
+            shutil.rmtree(self.worker_dir)
 
         # Create worker directory
         os.makedirs(self.worker_dir, exist_ok=True)
 
-        if os.path.exists(self.worker_ckpt):
-            with open(self.worker_ckpt, "r") as ckpt:
-                data = json.load(ckpt)
-
-            for job, info in data.items():
-                self.running_jobs[job] = info
-
-        # Apply everything listed on log file
-        if os.path.exists(self.worker_log):
-            with open(self.worker_log, "r") as f:
-                for line in f:
-                    self.log_count += 1
-                    if not line.strip():
-                        continue
-
-                    entry = json.loads(line)
-                    status = entry["status"]
-                    job = entry["job"]
-
-                    if status == "scheduled":
-                        self.running_jobs[job] = entry["info"]
-                    elif status == "finished":
-                        del self.running_jobs[job]
-
         # Create main and send socket and send registration for each
         # main socket
-        self.start_sock(self.main_sock, "main_sock")
+        self.start_sock(self.req_sock, "req_sock")
         
         # send socket
-        self.start_sock(self.send_sock, "send_sock")
+        self.start_sock(self.res_sock, "res_sock")
 
         # Start heartbeat thread
         heartbeat_thread = threading.Thread(target=self.heartbeat, daemon=True)
@@ -125,9 +101,9 @@ class Worker:
         print("Worker heartbeat thread started")
 
         # Start message sender thread
-        send_thread = threading.Thread(target=self.send_thread, daemon=True)
-        send_thread.start()
-        print("Worker send thread started")
+        res_thread = threading.Thread(target=self.res_thread, daemon=True)
+        res_thread.start()
+        print("Worker response thread started")
 
         self.run()
 
@@ -140,34 +116,10 @@ class Worker:
             while not self.register(sock, sock_type):
                 self.connect_to_coordinator(sock)
 
-            self.recv_ack(sock, sock_type)
+            if self.recv_ack(sock, sock_type):
+                return
 
             self.connect_to_coordinator(sock)
-
-    def recv_ack(self, sock, sock_type):
-        try:
-            # Receive registration ack
-            # If anything fails, restart connection to coordinator
-            length_bytes = self.recv_exact(4, sock)
-            resp_len = int.from_bytes(length_bytes, "big")
-
-            resp_bytes = self.recv_exact(resp_len, sock)
-                            
-            try:
-                response = json.loads(resp_bytes.decode("utf-8"))
-                    
-                if response["status"] == "failed":
-                    print(f"{sock_type}: ack failed")
-                else:
-                    print(f"{sock_type}: ack to {self.coord_name} succeeded")
-                    return True
-            except json.JSONDecodeError:
-                print(f"{sock_type}: Could not read ack from coordinator")
-
-        except Exception as e:
-            print(f"{sock_type}: Worker error when receiving ack: {e}")
-
-        return False
 
     def connect_to_coordinator(self, sock):
         print("Attempting to connect to coordinator")
@@ -252,15 +204,11 @@ class Worker:
             "type": "register"
         }
 
-        try:
-            pre_response = json.dumps(response).encode("utf-8")
-            response_length = len(pre_response).to_bytes(4, byteorder="big")
-            final_response = response_length + pre_response
-        except (TypeError, ValueError):
-            print(f"{sock_type}: Couldn't serialize response to JSON")
-            return False
+        pre_response = json.dumps(response).encode("utf-8")
+        response_length = len(pre_response).to_bytes(4, byteorder="big")
+        final_response = response_length + pre_response
 
-        # Retry on failure
+        # Return True if succeeded, False if failed
         try:
             sock.sendall(final_response)
             return True
@@ -317,9 +265,9 @@ class Worker:
     
     # ---------------------------------------------------------------------------
     # Main worker functions
-    # - Handles messages from coordinator
     # - run: receive messages
     # - execute: process messages
+    # - invalid_args: check if any expected args are not present
     # ---------------------------------------------------------------------------
     def run(self):
         data = b""
@@ -327,7 +275,7 @@ class Worker:
             # Get new message
             try:
                 # Read message (blocks)
-                buffer = self.main_sock.recv(BUFSIZ)
+                buffer = self.req_sock.recv(BUFSIZ)
                 data += buffer
             except ConnectionError:
                 data = b""
@@ -372,7 +320,7 @@ class Worker:
                 "status": "invalid",
                 "value": "Request is not valid JSON"
             }
-            with self.main_lock:
+            with self.req_lock:
                 self.send_message(response)
 
         # validate fields
@@ -381,7 +329,7 @@ class Worker:
                 "status": "invalid",
                 "message": "Missing method"
             }
-            with self.main_lock:
+            with self.req_lock:
                 self.send_message(response)
             return
         
@@ -396,30 +344,36 @@ class Worker:
                 task_dir = f"{self.worker_dir}/{request["job_id"]}"
                 zip_path = f"{task_dir}/{request["job_id"]}.zip" # working environment zip file
                 
-                os.makedirs(task_dir, exist_ok=True)
+                try:
+                    os.makedirs(task_dir, exist_ok=True)
 
-                with open(zip_path, "wb") as f:
-                    f.write(zip_data)
+                    with open(zip_path, "wb") as f:
+                        f.write(zip_data)
 
-                with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                    zip_ref.extractall(task_dir)
+                    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                        zip_ref.extractall(task_dir)
 
-                bash_script = os.path.join(task_dir, request["command_file"])
-                os.chmod(bash_script, 0o755)
+                    bash_script = os.path.join(task_dir, request["command_file"])
+                    os.chmod(bash_script, 0o755)
 
-                process = subprocess.Popen(
-                    ["bash", bash_script],
-                    cwd=task_dir
-                )
+                    process = subprocess.Popen(
+                        ["bash", bash_script],
+                        cwd=task_dir
+                    )
 
-                with self.jobs_lock:
-                    self.running_jobs[request["job_id"]] = process 
+                    with self.jobs_lock:
+                        self.running_jobs[request["job_id"]] = process 
 
-                response = {
-                    "type": "ack",
-                    "status": "scheduled",
-                    "job_id": request["job_id"]
-                }
+                    response = {
+                        "type": "ack",
+                        "status": "scheduled",
+                        "job_id": request["job_id"]
+                    }
+                except Exception as e:
+                    response = {
+                        "status": "error",
+                        "message": f"Internal worker error: {e}"
+                    }
             
             # Stop job
             case "stop":
@@ -428,29 +382,43 @@ class Worker:
                 
                 job_id = request["job_id"]
 
-                with self.jobs_lock:
-                    process = self.running_jobs[job_id]
+                try:
+                    with self.jobs_lock:
+                        process = self.running_jobs[job_id]
+                            
+                        process.terminate()
 
-                    print(f"Stopping job {job_id} from coordinator request")
+                        print(f"Terminated job {job_id} from coordinator request")
+
+                        del self.running_jobs[job_id]
                     
-                    process.terminate()
+                    response = {
+                        "status": "success",
+                        "message": "terminated job",
+                        "job_id": job_id
+                    }
+                except KeyError:
+                    response = {
+                        "status": "error",
+                        "message": "job id not found",
+                        "job_id": job_id
+                    }
 
-                    del self.running_jobs[job_id]
-
-                response = {
-                    "type": "ack",
-                    "status": "terminated",
-                    "job_id": job_id
-                }
+                except Exception as e:
+                    response = {
+                        "status": "error",
+                        "message": f"Internal worker error: {e}",
+                        "job_id": job_id
+                    }
 
             case _:
                 response = {
-                    "status": "invalid",
+                    "status": "error",
                     "message": "Invalid method requested"
                 }
             
-        with self.main_lock:
-            self.send_message(response, self.main_sock)
+        with self.req_lock:
+            self.send_message(response, self.req_sock)
         
     def invalid_args(self, args, request):
         for arg in args:
@@ -459,7 +427,7 @@ class Worker:
                     "status": "invalid",
                     "message": f"invalid, {arg} not present"
                 }
-                with self.main_lock:
+                with self.req_lock:
                     self.send_message(response)
                 return True
         return False
@@ -467,8 +435,10 @@ class Worker:
     # ---------------------------------------------------------------------------
     # Messaging Functions
     # - recv_exact: receive exact amount of bytes
+    # - recv_ack: receive acknowlegement from coordinator
     # - heartbeat: thread to send heartbeat to coordinator
-    # - send_thread: thread that sends messages to coordinator from send_queue
+    # - send_message: send message to coordinator
+    # - res_thread: thread that notifies coordinator of finished jobs
     # ---------------------------------------------------------------------------
     def recv_exact(self, bytes_len, sock):
         data = b""
@@ -479,21 +449,42 @@ class Worker:
             data += chunk
         return data
     
+    def recv_ack(self, sock, sock_type):
+        try:
+            length_bytes = self.recv_exact(4, sock)
+            resp_len = int.from_bytes(length_bytes, "big")
+
+            resp_bytes = self.recv_exact(resp_len, sock)
+                            
+            try:
+                response = json.loads(resp_bytes.decode("utf-8"))
+                    
+                if response["status"] == "failed":
+                    print(f"{sock_type}: ack failed")
+                    return False
+                else:
+                    print(f"{sock_type}: ack to {self.coord_name} succeeded")
+                    return True
+            except json.JSONDecodeError:
+                print(f"{sock_type}: Could not read ack from coordinator")
+                return False
+
+        except Exception as e:
+            print(f"{sock_type}: Worker error when receiving ack: {e}")
+
+        return False
+    
     def heartbeat(self):
-        with self.main_lock:
-            self.send_message(self.get_stats(), self.main_sock)
+        with self.req_lock:
+            self.send_message(self.get_stats(), self.req_sock)
 
         time.sleep(HEARTBEAT_INTERVAL)
 
     def send_message(self, message, sock):
         # send response
-        try:
-            pre_response = json.dumps(message).encode("utf-8")
-            response_length = len(pre_response).to_bytes(4, byteorder="big")
-            final_response = response_length + pre_response
-        except (TypeError, ValueError):
-            print(f"Worker Error: Couldn't serialize response to JSON")
-            return
+        pre_response = json.dumps(message).encode("utf-8")
+        response_length = len(pre_response).to_bytes(4, byteorder="big")
+        final_response = response_length + pre_response    
 
         # Retry on failure
         while True:
@@ -505,7 +496,7 @@ class Worker:
                 
                 self.start_sock(sock)
         
-    def send_thread(self):
+    def res_thread(self):
         """
         Send responses from queue
         """
@@ -530,12 +521,12 @@ class Worker:
                         }
 
                         # Send output
-                        self.send_message(message, self.send_sock)
+                        self.send_message(message, self.res_sock)
 
                         # Retry until we receive ack (idempotent)
-                        while not self.recv_ack(self.send_sock, "send_sock"):
-                            self.start_sock(self.send_sock, "send_sock")
-                            self.send_message(message, self.send_sock)
+                        while not self.recv_ack(self.res_sock, "res_sock"):
+                            self.start_sock(self.res_sock, "res_sock")
+                            self.send_message(message, self.res_sock)
 
                         # Remove job
                         with self.jobs_lock:
@@ -557,9 +548,9 @@ HEARTBEAT_INTERVAL seconds
 That way workers only send heartbeats based on when they registered so that coordinator is never 
 overloaded
 
-Client talks to Coordinator and sends executable
-Coordinator talks to worker and sends executable
-worker receives executable with bash script to run and runs it 
+Client talks to Coordinator and sends zipped working directory
+Coordinator talks to worker and sends zipped working directory
+worker receives zipped working directory and unzips it. Then runs bash script 
 worker sends result to coordinator when done
 """
 

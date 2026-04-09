@@ -1,1 +1,1 @@
-python Worker.py --worker w --coord coordinator --max_jobs 8
+python Worker.py --worker w --max_jobs 8

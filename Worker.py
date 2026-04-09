@@ -43,6 +43,7 @@ MAX_BACKOFF         = 64
 BUFSIZ              = 4096
 HEARTBEAT_INTERVAL  = 60
 MAX_LOG_COUNT       = 100
+MAX_JOBS            = 2
 
 # Catalog constant
 CATALOG_URL         = "catalog.cse.nd.edu"
@@ -67,7 +68,7 @@ class Worker:
     # - find_coordinator: contacts name server to find coordinator and returns True if it connected, False if not
     # - register: specific function to register a worker's socket
     # ---------------------------------------------------------------------------
-    def __init__(self, worker_name, max_jobs):
+    def __init__(self, worker_name, max_jobs=MAX_JOBS):
         self.worker_name = worker_name
         self.worker_dir = f"{self.worker_name}_dir"
 
@@ -556,12 +557,12 @@ worker sends result to coordinator when done
 """
 
 def main():
-    parser = argparse.ArgumentParser(description="Distributed job coordinator")
+    parser = argparse.ArgumentParser(description="Distributed job worker")
     parser.add_argument("--worker", required=True, type=str, help="Worker name")
-    parser.add_argument("--max_jobs", required=True, type=int, help="Max jobs worker can hold")
+    parser.add_argument("--max_jobs", type=int, default=MAX_JOBS, help=f"Max jobs worker can hold (default: {MAX_JOBS})")
     args = parser.parse_args()
 
-    Worker(args.worker,args.coord,args.max_jobs)
+    Worker(args.worker,args.max_jobs)
 
 if __name__ == "__main__":
     main()

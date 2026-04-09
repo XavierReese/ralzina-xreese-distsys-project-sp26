@@ -22,6 +22,9 @@ import sys
 import threading
 import time
 import zipfile
+import shlex
+import json
+import base64
 
 import requests
 
@@ -32,8 +35,8 @@ import requests
 # ---------------------------------------------------------------------------
 
 CATALOG_URL        = "http://catalog.cse.nd.edu:9097/query.json"
-COORDINATOR_TYPE   = "coordinator"          # TODO agree w/Rene
-COORDINATOR_PROJECT = "dist_job_coordinator" # TODO agree w/Rene
+COORDINATOR_TYPE   = "coordinator"
+COORDINATOR_PROJECT = "dist_job_coordinator"
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +88,6 @@ def send_message(sock: socket.socket, message: bytes) -> None:
     """
     Sends: 4-byte big-endian length prefix followed by the payload.
     """
-    # TODO: agree w/Rene
     sock.sendall(len(message).to_bytes(4, byteorder="big") + message)
 
 
@@ -126,11 +128,16 @@ def connect_to_coordinator(username: str) -> socket.socket:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((host, port))
-            send_message(sock, f"JOIN {username}".encode())
-            print(f"[INFO] Joined coordinator as '{username}'")
+
+            join_msg = {
+                    "method": "JOIN_CLIENT",
+                    "username": username
+            }
+            send_message(sock, json.dumps(join_msg).encode('utf-8'))
+            print(f"[JOIN] Requested to join coordinator as '{username}'")
             return sock
         except OSError as exc:
-            print(f"[INFO] Connection failed ({exc}), rediscovering ...")
+            print(f"[JOIN] Connection failed ({exc}), rediscovering ...")
             time.sleep(2)
 
 
@@ -157,8 +164,8 @@ def zip_directory(dir_path: str) -> bytes:
     return buf.getvalue()
 
 
-def extract_zip(zip_bytes: bytes, out_dir: str) -> None:
-    os.makedirs(out_dir, exist_ok=True)
+def extract_zip(zip_bytes: bytes, job_id: str) -> None:
+    os.makedirs(f'./results_{job_id}', exist_ok=True)
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         zf.extractall(out_dir)
 
@@ -172,21 +179,25 @@ def build_submit_message(username: str,
                          exec_script: str,
                          outputs: list[str],
                          zip_bytes: bytes) -> bytes:
-    """
-    SUBMIT_JOB <username> <exec_script> <out1,out2,...>\n<zip bytes>
+    message_dict = {
+        "method": "SUBMIT_JOB",
+        "username": username,
+        "exec_script": exec_script,
+        "outputs": outputs,
+        "zip_data": base64.b64encode(zip_bytes).decode('utf-8')
+    }
 
-    TODO: replace header format with whatever is agreed with your partner.
-    """
-    outputs_str = ",".join(outputs) if outputs else ""
-    header = f"SUBMIT_JOB {username} {exec_script} {outputs_str}\n".encode()
-    return header + zip_bytes
+    return json.dumps(message_dict).encode('utf-8')
+
 
 
 def build_stats_message(username: str) -> bytes:
-    """
-    JOB_STATS <username>
-    """
-    return f"JOB_STATS {username}".encode()
+    message_dict = {
+        "method": "JOB_STATS",
+        "username": username,
+    }
+
+    return json.dumps(message_dict).encode('utf-8')
 
 
 # ---------------------------------------------------------------------------
@@ -206,17 +217,7 @@ class Session:
     def __init__(self, sock: socket.socket, username: str):
         self.sock                             = sock
         self.username                         = username
-        self.pending_out_dirs: dict[str, str] = {} #TODO Whats this?
-        self._lock                            = threading.Lock()
-
-    def register_job(self, job_id: str, out_dir: str) -> None:
-        with self._lock:
-            self.pending_out_dirs[job_id] = out_dir
-
-    def pop_out_dir(self, job_id: str) -> str | None:
-        with self._lock:
-            return self.pending_out_dirs.pop(job_id, None)
-
+        self.connected                        = False
 
 # ---------------------------------------------------------------------------
 # Background receiver thread
@@ -235,8 +236,11 @@ def receiver_loop(session: Session) -> None:
             message = recv_message(session.sock)
         except ConnectionError as exc:
             print(f"\n[DISCONNECTED] {exc}")
-            # TODO reconnect + re-JOIN here?
-            break
+
+            session.connected = False
+            new_sock = connect_to_coordinator(session.username) # triggers retries until connected
+            session.sock = new_sock
+            continue
 
         _handle_push(session, message)
         print("> ", end="", flush=True)  # restore prompt after async output
@@ -244,13 +248,42 @@ def receiver_loop(session: Session) -> None:
 
 def _handle_push(session: Session, message: bytes) -> None:
     """Dispatch a coordinator-pushed message to the right handler."""
-    newline_idx  = message.find(b"\n")
-    header_bytes = message[:newline_idx] if newline_idx != -1 else message
-    payload      = message[newline_idx + 1:] if newline_idx != -1 else b""
+    try:
+        msg = json.loads(message.decode('utf-8'))
+    except Exception as e:
+        print(f'[ERROR] Failed ot decode message: {message}\nError: {e}')
+        return
 
-    parts = header_bytes.decode(errors="replace").split(" ", 2)
-    tag   = parts[0] if parts else ""
+    if "tag" not in msg or msg.get("tag") is None:
+        print(f'[ERROR] Invalid message received from coordinator - no tag: {msg}')
 
+    tag = msg.get("tag")
+
+    if tag == "ERROR":
+        message = msg.get("message", "no error provided")
+        print(f'[ERROR] {e}')
+    elif tag == "ACK_JOIN":
+        session.connected = True
+        print(f'[JOIN] Successful')
+    elif tag == "JOB_STATS":
+        jobs = msg.get("message", [])
+        if len(jobs) == 0:
+            print(f'[STATS] No jobs associated with user {session.username}')
+        else:
+            for j in jobs:
+                print(f'\n{j}') # TODO prettier printing after format has settled
+
+    elif tag == "ACK_SUBMIT":
+        job_id = msg.get("message")
+        if not job_id:
+            print(f'[ERROR] Internal Error: No job_id provided by coordinator')
+        else:
+            print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./results_{job_id}')
+        
+
+    #print(f"\n((client._hand_push)) Message Received: {msg}")
+
+    '''
     if tag == "RESULT":
         # Format: RESULT <job_id>\n<zip bytes>
         job_id  = parts[1] if len(parts) > 1 else "unknown"
@@ -275,6 +308,7 @@ def _handle_push(session: Session, message: bytes) -> None:
 
     else:
         print(f"\n[COORDINATOR] {header_bytes.decode(errors='replace')}")
+    '''
 
 
 # ---------------------------------------------------------------------------
@@ -287,7 +321,6 @@ def handle_submit(session: Session, args: argparse.Namespace) -> None:
         return
 
     outputs = args.outputs or []
-    out_dir = args.out_dir or f"./results_{os.path.basename(args.job.rstrip('/'))}"
 
     print(f"[INFO] Zipping {args.job} ...")
     try:
@@ -308,9 +341,6 @@ def handle_submit(session: Session, args: argparse.Namespace) -> None:
     except OSError as exc:
         print(f"[ERROR] Failed to send job: {exc}")
         return
-
-    print(f"[INFO] Job submitted. Results will auto-extract to: {out_dir}")
-
 
 def handle_stats(session: Session) -> None:
     try:
@@ -334,8 +364,6 @@ def make_repl_parser() -> argparse.ArgumentParser:
                           help="Entry-point script relative to the job directory root")
     p_submit.add_argument("--outputs", nargs="*", default=[],
                           help="Relative paths inside the job dir to retrieve on completion")
-    p_submit.add_argument("--out-dir", dest="out_dir", default=None,
-                          help="Local directory to auto-extract results into")
 
     sub.add_parser("stats", exit_on_error=False)
     sub.add_parser("quit",  exit_on_error=False)
@@ -388,7 +416,7 @@ def run_session(username: str) -> None:
             continue
 
         try:
-            args = repl_parser.parse_args(line.split())
+            args = repl_parser.parse_args(shlex.split(line))
         except (argparse.ArgumentError, SystemExit):
             print("[ERROR] Unrecognised command or bad arguments. Type 'help' for usage.")
             continue

@@ -13,6 +13,7 @@ import time
 import os
 import argparse
 import select
+import uuid
 
 COORDINATOR_TYPE = "coordinator"
 COORDINATOR_PROJECT = "dist_job_coordinator"
@@ -50,7 +51,7 @@ def identify_peer(first_msg):
     '''
     identify first message as either client or worker
     '''
-    if first_msg[:4] == "JOIN":
+    if first_msg[:4] == b"JOIN":
         return "client", first_msg.decode("utf-8", errors="replace")
 
     else:
@@ -76,7 +77,8 @@ class Coordinator:
                 "pending_results": [
                     {"job_id": 101, "status": "finished", ...},
                     ...
-                ]
+                ],
+                "fileno": fileno from socket for epoll
             }
         }
         Regardless, I'm not working with clients, just a thought
@@ -176,9 +178,9 @@ class Coordinator:
                         epoll.register(client_socket.fileno(), select.EPOLLIN)
                         connections[client_socket.fileno()] = {
                             "socket": client_socket,
-                            "sock_type": None,      # both client & worker use two sockets, this tells you what socket it is
+                            "sock_type": None,      # both worker uses two sockets, this tells you what socket it is. Client uses one socket, and leaves this as None
                             "id": None,             # either username or worker_id
-                            "type": None,           # either worker or client
+                            "type": None,           # either "worker" or "CLIENT"
                             "recv_buffer": b"",
                             "send_buffer": b""
                         }
@@ -198,7 +200,7 @@ class Coordinator:
                             client_socket.close()
                             continue
                             
-                        # If client is new, it will send its information
+                        # If client is new, it will send its username
                         # If it's not then it will send a normal request
                         # Normal requests don't return anything in handle_request
                         # Name requests return the peer name in handle_request
@@ -207,7 +209,7 @@ class Coordinator:
                             if id != None:
                                 connections[fileno]["id"] = id
                                 connections[fileno]["type"] = type
-                                connections[fileno]["sock_type"] = sock_type
+                                if sock_type != None: connections[fileno]["sock_type"] = sock_type
                                 new_connections.add(id)
                         else:
                             self.handle_request(connections[fileno], fileno)
@@ -248,27 +250,29 @@ class Coordinator:
         buffer = connection["recv_buffer"]
 
         r = None
+
+        # Need at least 4 bytes to know message length
+        if len(buffer) < 4:
+            print('[DEBUG] coord handle_request: not enough for msg length')
+            return None
+
+        # Read length if available
+        message_len = int.from_bytes(buffer[:4], "big")
                 
-        while True:
-            # Need at least 4 bytes to know message length
-            if len(buffer) < 4:
-                break
+        # Check if full message arrived:
+        if len(buffer) < 4 + message_len:
+            print('[DEBUG] coord handle_request: incomplete message received')
+            return None
 
-            # Read length if available
-            message_len = int.from_bytes(buffer[:4], "big")
+        # Read full message
+        message_bytes = buffer[4:4+message_len]
+        print(f'[DEBUG] Incoming Message: {message_bytes}')
 
-            # Check if full message arrived:
-            if len(buffer) < 4 + message_len:
-                break
+        # Remove processed bytes from buffer
+        buffer = buffer[4 + message_len:]
 
-            # Read full message
-            message_bytes = buffer[4:4+message_len]
-
-            # Remove processed bytes from buffer
-            buffer = buffer[4 + message_len:]
-
-            # Execute request
-            r = self.execute(message_bytes, connection, fileno)
+        # Execute request
+        r = self.execute(message_bytes, connection, fileno)
 
         # Save remaining data to be handled later
         connection["recv_buffer"] = buffer
@@ -316,6 +320,94 @@ class Coordinator:
                 
                 return id, sock_type, type
 
+            # ------ Client Methods ------
+            case "JOIN_CLIENT":
+                if self.invalid_args(["username"], request, connection, fileno):
+                    return
+
+                id = request["username"]
+                type = "CLIENT"
+
+                if id not in self.clients:
+                    self.clients[id] = {
+                        "socket": connection["socket"],
+                        "pending_results": []
+                    }
+                else:
+                    self.clients[id]["socket"] = connection["socket"]
+                    if len(self.clients[id]["pending_results"]) > 0:
+                        # TODO return pending results as well if there are any for this client
+                        pass
+
+                response = {
+                    "tag": "ACK_JOIN",
+                    "message": "hello"
+                }
+                self.schedule_response(response, connection, fileno)
+                print(f'[CLIENT_JOIN] client {id} joined')
+
+                return id, None, type
+
+            case "JOB_STATS":
+                if connection["type"] != "CLIENT":
+                    self.error_res("Please JOIN first if you are a client", connection, fileno)
+                    return
+
+                if self.invalid_args(["username"], request, connection, fileno):
+                    return
+
+                username = request["username"]
+
+                if username not in self.clients:
+                    self.error_res("Please JOIN first", connection, fileno)
+                    return
+
+                if fileno != self.clients[username]["socket"].fileno():
+                    self.error_res(f'Socket not associated with {username}, please leave and rejoin', connection, fileno)
+
+                jobs = []
+
+                for jid, j in self.jobs.items():
+                    if j["client_id"] == username:
+                        jobs.append((jid, j))
+
+                #print(f'DEBUG: JOBS: {jobs}')
+                response = {
+                    "status": "ok",
+                    "tag": "JOB_STATS",
+                    "message": jobs
+                }
+                self.schedule_response(response, connection, fileno)
+                return
+
+            case "SUBMIT_JOB":
+                if connection["type"] != "CLIENT":
+                    self.error_res("Please JOIN first if you are a client", connection, fileno)
+                    return
+
+                if self.invalid_args(["username", "exec_script", "outputs", "zip_data"], request, connection, fileno):
+                    return
+
+                username = request["username"]
+
+                if username not in self.clients:
+                    self.error_res("Please JOIN first", connection, fileno)
+                    return
+
+                if fileno != self.clients[username]["socket"].fileno():
+                    self.error_res(f'Socket not associated with {username}, please leave and rejoin', connection, fileno)
+
+
+                job_id = self.incoming_job(username, request["exec_script"], request["outputs"], request["zip_data"])
+
+                response = {
+                    "tag": "ACK_SUBMIT",
+                    "message": job_id
+                }
+                self.schedule_response(response, connection, fileno)
+                return
+
+
             case _:
                 response = {
                     "status": "invalid",
@@ -333,6 +425,15 @@ class Coordinator:
                 self.schedule_response(response, connection, fileno)
                 return True
         return False
+
+    def error_res(self, err_message: str, connection, fileno):
+        ''' Schedule an error response '''
+        response = {
+            "tag": "ERROR",
+            "status": "invalid",
+            "message": err_message
+        }
+        self.schedule_response(response, connection, fileno)
     
     def schedule_response(self, response, connection, fileno):
         try:
@@ -360,6 +461,25 @@ class Coordinator:
             except socket.error as e:
                 print(f"[COORD] Network Error: Failed to send response: {e}")
                 return False # network error, client disconnected
+
+    # -----------------------------------
+    # State Updating Functions
+    # - standardize adding/removing jobs, etc
+    # -----------------------------------
+
+    def incoming_job(self, username, script, outputs, dir_zip):
+        job_id = str(uuid.uuid4())
+        self.jobs[job_id] = {
+            "client_id": username,
+            "worker_id": None,     # or None if not scheduled / rescheduled,
+            "status": "not_started",
+            "script": script,        # script to run program
+            "output_files": outputs,
+            "zip": dir_zip,
+            "result": None          # store stdout, stderr
+        }
+        
+        return job_id
 
     # ------------------------------------
     # Catalog Update

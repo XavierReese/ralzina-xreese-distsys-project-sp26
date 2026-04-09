@@ -29,10 +29,10 @@ import sys
 import os
 import shutil
 import threading
-import queue
 import subprocess
 import base64
 import zipfile
+import argparse
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -90,10 +90,10 @@ class Worker:
 
         # Create main and send socket and send registration for each
         # main socket
-        self.start_sock(self.req_sock, "req_sock")
+        self.req_sock = self.start_sock("req_sock")
         
         # send socket
-        self.start_sock(self.res_sock, "res_sock")
+        self.res_sock = self.start_sock("res_sock")
 
         # Start heartbeat thread
         heartbeat_thread = threading.Thread(target=self.heartbeat, daemon=True)
@@ -107,21 +107,21 @@ class Worker:
 
         self.run()
 
-    def start_sock(self, sock, sock_type):
-        self.connect_to_coordinator(sock)
+    def start_sock(self, sock_type):
+        sock = self.connect_to_coordinator()
 
         # Retry until connected
         while True:
             # send registration
             while not self.register(sock, sock_type):
-                self.connect_to_coordinator(sock)
+                sock = self.connect_to_coordinator()
 
             if self.recv_ack(sock, sock_type):
-                return
+                return sock
 
             self.connect_to_coordinator(sock)
 
-    def connect_to_coordinator(self, sock):
+    def connect_to_coordinator(self):
         print("Attempting to connect to coordinator")
 
         # Connect to coordinator
@@ -130,7 +130,7 @@ class Worker:
         while True:
             sock = self.find_coordinator() 
             if sock is not None:
-                return
+                return sock
             if backoff >= MAX_BACKOFF:
                 print(f"Max backoff reached: {MAX_BACKOFF}. Quitting...")
                 sys.exit(1)
@@ -169,9 +169,9 @@ class Worker:
         conn.close()
 
         matching_services = [
-            (s["name"], s["port"], s["lastheardfrom"], s["coord_name"])
+            (s["name"], s["port"], s["lastheardfrom"])
             for s in services
-            if ("type" in s and s["type"] == COORDINATOR_TYPE) and ("coord_name" in s and s["coord_name"] == self.coord_name)
+            if ("type" in s and s["type"] == COORDINATOR_TYPE) and ("project" in s and s["project"] == COORDINATOR_PROJECT) and ("owner" in s and s["owner"] == "xreese")
         ]
 
         if matching_services:
@@ -201,7 +201,9 @@ class Worker:
     def register(self, sock, sock_type):
         response = {
             "sock_type": sock_type,
-            "type": "register"
+            "method": "register",
+            "type": "worker",
+            "id": self.worker_name,
         }
 
         pre_response = json.dumps(response).encode("utf-8")
@@ -321,7 +323,7 @@ class Worker:
                 "value": "Request is not valid JSON"
             }
             with self.req_lock:
-                self.send_message(response)
+                self.send_message(response, self.req_sock)
 
         # validate fields
         if "method" not in request:
@@ -330,7 +332,7 @@ class Worker:
                 "message": "Missing method"
             }
             with self.req_lock:
-                self.send_message(response)
+                self.send_message(response, self.req_sock)
             return
         
         # Perform operation
@@ -428,7 +430,7 @@ class Worker:
                     "message": f"invalid, {arg} not present"
                 }
                 with self.req_lock:
-                    self.send_message(response)
+                    self.send_message(response, self.req_sock)
                 return True
         return False
 
@@ -555,14 +557,13 @@ worker sends result to coordinator when done
 """
 
 def main():
-    if len(sys.argv) < 4:
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Distributed job coordinator")
+    parser.add_argument("--worker", required=True, type=str, help="Worker name")
+    parser.add_argument("--coord", required=True, type=str, help="Coordinator name")
+    parser.add_argument("--max_jobs", required=True, type=int, help="Max jobs worker can hold")
+    args = parser.parse_args()
 
-    worker_name = sys.argv[1]
-    coord_name = sys.argv[2]
-    max_jobs = int(sys.argv[3])
-
-    Worker(worker_name,coord_name,max_jobs)
+    Worker(args.worker,args.coord,args.max_jobs)
 
 if __name__ == "__main__":
     main()

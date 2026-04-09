@@ -8,12 +8,19 @@ Date April 2026
 
 import threading
 import json
+import socket
+import time
+import os
+import argparse
+import select
 
 COORDINATOR_TYPE = "coordinator"
 COORDINATOR_PROJECT = "dist_job_coordinator"
 
 CATALOG_HOST = "catalog.cse.nd.edu"
 CATALOG_PORT = 9097
+
+BUFSIZ = 4096
 
 # ----------------
 # Message Helpers
@@ -49,55 +56,60 @@ def identify_peer(first_msg):
     else:
         return "worker", None #TODO parse and return worker message
 
-# ------------------------------------
-# Catalog Update
-# - called in coord.start as heartbeat
-# ------------------------------------
-
-def update(port):
-    self.catalog_s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    self.catalog_s.connect((CATALOG_HOST, CATALOG_PORT))
-
-    while True:
-        u = {
-                "type": COORDINATOR_TYPE,
-                "port": port,
-                "owner": "xreese", # can this be both?
-                "project": COORDINATOR_PROJECT
-            }
-
-        try:
-            msg = json.dumps(u).encode('utf-8')
-            self.catalog_s.sendto(msg, (CATALOG_HOST, CATALOG_PORT))
-            print("[COORD] Catalog Update Sent")
-        except Exception as e:
-            print(f"Failed to send update: {e}")
-        time.sleep(60)
-
 # -------------------
 # Coordinator
 # - manages state of jobs and connections
 # -------------------
 
 class Coordinator:
-    def __init__(self, coord_name="coordinator"):
+    def __init__(self, port, coord_name="coordinator"):
 
         self.coord_name = coord_name
+        self.port = port
 
         # --- State of Clients, Workers, and Jobs ---
-        self.clients: dict[str, int] = {} # username -> socket
-        self.workers: dict[int, int] = {} # worker_id -> socket
+        """
+        Rene: self.clients doesn't have a specific type structure, the structure should be:
+        self.clients = {
+            "username": {
+                "socket": <socket_object>,
+                "pending_results": [
+                    {"job_id": 101, "status": "finished", ...},
+                    ...
+                ]
+            }
+        }
+        Regardless, I'm not working with clients, just a thought
+        """
+        self.clients = {} 
+        self.contact_workers = {} # worker_fd -> socket_type, worker_id for epoll
+        self.workers = {} # worker_id -> stats for heartbeat
         
-        job_queue = []
-
-        self.running_jobs: dict[int: int] = {}  # job_id -> worker_id
+        # Rene: based on ckpt, this should be self.jobs imo
+        """
+        self.jobs[job_id] = {
+            "client_id": "client",
+            "worker_id": worker_id,     # or None if not scheduled / rescheduled,
+            "status": "running",
+            "script": "start.sh"        # script to run program
+            "result": None              # store stdout, stderr
+        }
+        """
+        self.jobs = {} 
 
         self.lock = threading.Lock() # separate threads for clients & workers use this to lock coord state
 
         # --- Persistence ---
         self.ckpt_path = f"{self.coord_name}.ckpt"
         self.txn_path  = f"{self.coord_name}.txn"
+
+        # Rene: the coord shouldn't have one subdir per job_id. I say it should have 
+        # one general job directory, and just save the zip files in that directory
+        # it's the worker's responsibility to create a subdir per job_id since it's
+        # the worker that will actually run the code, not the coord.
+        # So this line of code is fine, leave as is, I just mean there shouldn't be any more job directories other than this one
         self.jobs_dir  = f"{self.coord_name}_jobs"   # one subdir per job_id on disk
+
         os.makedirs(self.jobs_dir, exist_ok=True)
 
         # --- Recover from last checkpoint + transaction log ---
@@ -108,18 +120,275 @@ class Coordinator:
     # - called in main()
     # - starts various threads then waits for new connections
     # -------------------------------------------------------
-    def start():
+    def start(self):
+        # Rene: Created socket before calling update thread, it's safer
+        # saved socket as an attribute rather than locally
+        # Connect to HOST, PORT
+        self.server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_sock.bind(("", self.port))
+        self.server_sock.listen(16)
+
+        _, self.port = self.server_sock.getsockname()
+        print(f"[COORD] Listening on port {self.port}")
+
+        # Set log count to 0 before starting up
+        self.log_count = 0
+
+        # Start epoll and connections
+        self.connections = {}
+        self.epoll = select.epoll()
+
         # Catalog Update Heartbeat
-        threading.Thread(target=update, args=(self.port), daemon=True).start()
+        threading.Thread(target=self.update, args=(self.port,), daemon=True).start()
 
         # Worker Watcher (hears heartbeats and notices dead workers)
         # TODO
 
         # Dispatcher (pull from job_queue, send to best worker)
         # TODO
-
         
-        self._accept_loop()
+        # self._accept_loop()
+        self.run()
+
+    # Rene, trying epoll
+    # All the following functions are mine up to def update (not invlusive so def update is not mine)
+    def run(self):
+        epoll = self.epoll
+
+        self.server_sock.setblocking(False)
+        epoll.register(self.server_sock.fileno(), select.EPOLLIN)
+
+        connections = self.connections
+        new_connections = set()
+
+        try:
+            while True:         
+                events = epoll.poll(1) # 1 second timeout
+
+                for fileno, event in events:
+                    if fileno == self.server_sock.fileno():
+                        # Accepting clients
+                        client_socket, client_addr = self.server_sock.accept()
+                        # Client socket is the socket to talk to the received client
+                        # Client address has (IP, port) of the client
+                        client_socket.setblocking(False)
+                        epoll.register(client_socket.fileno(), select.EPOLLIN)
+                        connections[client_socket.fileno()] = {
+                            "socket": client_socket,
+                            "sock_type": None,      # both client & worker use two sockets, this tells you what socket it is
+                            "id": None,             # either username or worker_id
+                            "type": None,           # either worker or client
+                            "recv_buffer": b"",
+                            "send_buffer": b""
+                        }
+
+                    elif event & select.EPOLLIN:
+                        connection = connections[fileno]
+                        client_socket = connection["socket"]
+
+                        self.read_buffer(connection)
+                        buffer = connection["recv_buffer"]
+
+                        if not buffer:
+                            print(f"[COORD] {connection["type"]}_{connection["id"]}_{connection["sock_type"]} disconnected")
+                            # Client broke connection
+                            epoll.unregister(fileno)
+                            del connections[fileno]
+                            client_socket.close()
+                            continue
+                            
+                        # If client is new, it will send its information
+                        # If it's not then it will send a normal request
+                        # Normal requests don't return anything in handle_request
+                        # Name requests return the peer name in handle_request
+                        if connections[fileno]["id"] == None:
+                            id, sock_type, type = self.handle_request(connections[fileno], fileno)
+                            if id != None:
+                                connections[fileno]["id"] = id
+                                connections[fileno]["type"] = type
+                                connections[fileno]["sock_type"] = sock_type
+                                new_connections.add(id)
+                        else:
+                            self.handle_request(connections[fileno], fileno)
+
+                    elif event & select.EPOLLOUT:
+                        connection = connections[fileno]
+                        client_socket = connection["socket"]
+
+                        if self.send_response(connections[fileno]):
+                            if not connections[fileno]["send_buffer"]:
+                                connection = connections[fileno]["id"]
+                                if connection in new_connections:
+                                    print(f"[COORD] Finished sending OK to {connection}.")
+                                    new_connections.remove(connection)
+                                epoll.modify(fileno, select.EPOLLIN)
+                        else:
+                            print(f"{connection["id"]} disconnected")
+                            epoll.unregister(fileno)
+                            del connections[fileno]
+                            client_socket.close()
+                            continue
+        except Exception as e:
+            print(f"[COORD] crashed:",e)
+            raise
+
+    def read_buffer(self, connection):
+        client_socket = connection["socket"]
+
+        # New message
+        try:
+            # Read message length
+            length_bytes = client_socket.recv(BUFSIZ)
+            connection["recv_buffer"] += length_bytes
+        except ConnectionError:
+            connection["recv_buffer"] = b""
+
+    def handle_request(self, connection, fileno):
+        buffer = connection["recv_buffer"]
+
+        r = None
+                
+        while True:
+            # Need at least 4 bytes to know message length
+            if len(buffer) < 4:
+                break
+
+            # Read length if available
+            message_len = int.from_bytes(buffer[:4], "big")
+
+            # Check if full message arrived:
+            if len(buffer) < 4 + message_len:
+                break
+
+            # Read full message
+            message_bytes = buffer[4:4+message_len]
+
+            # Remove processed bytes from buffer
+            buffer = buffer[4 + message_len:]
+
+            # Execute request
+            r = self.execute(message_bytes, connection, fileno)
+
+        # Save remaining data to be handled later
+        connection["recv_buffer"] = buffer
+
+        return r
+    
+    def execute(self, message_bytes, connection, fileno):
+
+        try:
+            request = json.loads(message_bytes.decode("utf-8"))
+        
+        except (TypeError, ValueError):
+            response = {
+                "status": "invalid",
+                "message": "Request is not valid JSON"
+            }
+            self.schedule_response(response, connection, fileno)
+            return 
+
+        # validate fields
+        if "method" not in request:
+            response = {
+                "status": "invalid",
+                "message": "Missing method"
+            }
+            self.schedule_response(response, connection, fileno)
+            return
+
+        # Perform operation
+        match request["method"]:
+            case "register":
+                if self.invalid_args(["id", "sock_type", "type"], request, connection, fileno):
+                    return
+                
+                id = request["id"]
+                sock_type = request["sock_type"]
+                type = request["type"]
+
+                response = {
+                    "status": "ok",
+                    "message": "Registered"
+                }
+
+                self.schedule_response(response, connection, fileno)
+                
+                return id, sock_type, type
+
+            case _:
+                response = {
+                    "status": "invalid",
+                    "message":  "Invalid method requested"
+                }
+                self.schedule_response(response, connection, fileno)
+
+    def invalid_args(self, args, request, connection, fileno):
+        for arg in args:
+            if arg not in request:
+                response = {
+                    "status": "invalid",
+                    "message": f"invalid, {arg} not present"
+                }
+                self.schedule_response(response, connection, fileno)
+                return True
+        return False
+    
+    def schedule_response(self, response, connection, fileno):
+        try:
+            pre_response = json.dumps(response).encode("utf-8")
+            response_length = len(pre_response).to_bytes(4, byteorder="big")
+            final_response = response_length + pre_response
+        except (TypeError, ValueError):
+            print(f"[COORD] Error: Couldn't serialize response to JSON")
+
+        connection["send_buffer"] += final_response
+        self.epoll.modify(fileno, select.EPOLLIN | select.EPOLLOUT)
+
+    def send_response(self, connection):
+        client_socket = connection["socket"]
+        send_buffer = connection["send_buffer"]
+
+        if send_buffer:
+            try:
+                sent = client_socket.send(send_buffer)
+                connection["send_buffer"] = send_buffer[sent:]
+                return True
+            except BlockingIOError:
+                return True # try again next EPOLLOUT
+
+            except socket.error as e:
+                print(f"[COORD] Network Error: Failed to send response: {e}")
+                return False # network error, client disconnected
+
+    # ------------------------------------
+    # Catalog Update
+    # - called in coord.start as heartbeat
+    # ------------------------------------
+    # Rene, I placed it here because I suppose this is part of coordinator
+    def update(self, port):
+        # Rene: you used to have self.catalog_s, but if the socket
+        # is created each time, might as well just not make it an attribute
+        while True:
+            u = {
+                    "type": COORDINATOR_TYPE,
+                    "port": port,
+                    "owner": "xreese", # can this be both?
+                    "project": COORDINATOR_PROJECT
+                }
+
+            try:
+                catalog_s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                catalog_s.connect((CATALOG_HOST, CATALOG_PORT))
+
+                msg = json.dumps(u).encode('utf-8')
+                catalog_s.sendto(msg, (CATALOG_HOST, CATALOG_PORT))
+                print("[COORD] Catalog Update Sent")
+            except Exception as e:
+                print(f"Failed to send update: {e}")
+
+            catalog_s.close()
+            time.sleep(60)
 
     # ----------------------------------
     # Accept Loop
@@ -129,13 +398,8 @@ class Coordinator:
     # ---------------------------------
 
     def _accept_loop(self) -> None:
-        server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_sock.bind(("", self.port))
-        server_sock.listen(16)
-
         while True:
-            conn, addr = server_sock.accept()
+            conn, addr = self.server_sock.accept()
             threading.Thread(
                 target=self._identify_and_dispatch,
                 args=(conn, addr),
@@ -295,6 +559,7 @@ class Coordinator:
  
         TODO: call this periodically from a background thread so the txn
         log doesn't grow forever.
+        Rene: Have an internal log_count so that you don't need threads + locking (nobody wnats that)
         """
         with self.lock:
             snapshot = {

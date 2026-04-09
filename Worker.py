@@ -2,7 +2,7 @@
 Worker.py  -  worker program for the distributed job coordinator.
 
 Usage:
-    python Worker.py <worker_name> <coord_name> <max_jobs>
+    python Worker.py <worker_name> <max_jobs>
 
 The coordinator is discovered automatically via the ND catalog service.
 Once connected, worker creates two socks and registers each sock separately with coordinator
@@ -67,10 +67,9 @@ class Worker:
     # - find_coordinator: contacts name server to find coordinator and returns True if it connected, False if not
     # - register: specific function to register a worker's socket
     # ---------------------------------------------------------------------------
-    def __init__(self, worker_name, coord_name, max_jobs):
+    def __init__(self, worker_name, max_jobs):
         self.worker_name = worker_name
         self.worker_dir = f"{self.worker_name}_dir"
-        self.coord_name = coord_name
 
         self.req_sock = None
         self.req_lock = threading.Lock() # need a lock to share with heartbeat thread
@@ -155,11 +154,11 @@ class Worker:
             response = conn.getresponse()
             
         except Exception:
-            print(f"Worker for {self.coord_name} Could not contact catalog")
+            print(f"Worker for {COORDINATOR_TYPE} Could not contact catalog")
             return None
         
         if response.status != 200:
-            print(f"[Worker for {self.coord_name} Could not contact catalog: HTTP error {response.status}")
+            print(f"[Worker for {COORDINATOR_TYPE} Could not contact catalog: HTTP error {response.status}")
             return None
         
         data = response.read()
@@ -195,7 +194,7 @@ class Worker:
             return new_sock
             
         except Exception as e:
-            print(f"Worker for {self.coord_name} socket creation failed: {e}")
+            print(f"Worker for {COORDINATOR_TYPE} socket creation failed: {e}")
             return None
 
     def register(self, sock, sock_type):
@@ -465,7 +464,7 @@ class Worker:
                     print(f"{sock_type}: ack failed")
                     return False
                 else:
-                    print(f"{sock_type}: ack to {self.coord_name} succeeded")
+                    print(f"{sock_type}: ack to {COORDINATOR_TYPE} succeeded")
                     return True
             except json.JSONDecodeError:
                 print(f"{sock_type}: Could not read ack from coordinator")
@@ -559,7 +558,6 @@ worker sends result to coordinator when done
 def main():
     parser = argparse.ArgumentParser(description="Distributed job coordinator")
     parser.add_argument("--worker", required=True, type=str, help="Worker name")
-    parser.add_argument("--coord", required=True, type=str, help="Coordinator name")
     parser.add_argument("--max_jobs", required=True, type=int, help="Max jobs worker can hold")
     args = parser.parse_args()
 

@@ -32,6 +32,7 @@ import threading
 import subprocess
 import base64
 import zipfile
+import io
 import argparse
 
 # ---------------------------------------------------------------------------
@@ -50,6 +51,11 @@ CATALOG_URL         = "catalog.cse.nd.edu"
 CATALOG_PORT        = 9097
 COORDINATOR_TYPE    = "coordinator"          
 COORDINATOR_PROJECT = "dist_job_coordinator"
+
+# Exception to detect network loss
+class NetworkError(Exception):
+    """Custom error to signal a network collapse."""
+    pass
 
 # ---------------------------------------------------------------------------
 # Worker class
@@ -76,9 +82,17 @@ class Worker:
         self.req_lock = threading.Lock() # need a lock to share with heartbeat thread
         self.res_sock = None
 
-        self.max_jobs = max_jobs
-        self.running_jobs = {}
         self.jobs_lock = threading.Lock()
+        self.max_jobs = max_jobs
+
+        self.reset_signal = threading.Event()
+        self.reset()
+
+        self.run()
+
+    def reset(self):
+
+        self.running_jobs = {}
 
         if os.path.exists(self.worker_dir):
             print(f"Detected existing workspace. Cleaning up old data...")
@@ -89,11 +103,13 @@ class Worker:
         os.makedirs(self.worker_dir, exist_ok=True)
 
         # Create main and send socket and send registration for each
-        # main socket
-        self.req_sock = self.start_sock("req_sock")
-        
         # send socket
         self.res_sock = self.start_sock("res_sock")
+
+        # main socket
+        self.req_sock = self.start_sock("req_sock")
+
+        self.reset_signal.clear()
 
         # Start heartbeat thread
         heartbeat_thread = threading.Thread(target=self.heartbeat, daemon=True)
@@ -104,8 +120,6 @@ class Worker:
         res_thread = threading.Thread(target=self.res_thread, daemon=True)
         res_thread.start()
         print("Worker response thread started")
-
-        self.run()
 
     def start_sock(self, sock_type):
         sock = self.connect_to_coordinator()
@@ -119,7 +133,7 @@ class Worker:
             if self.recv_ack(sock, sock_type):
                 return sock
 
-            self.connect_to_coordinator(sock)
+            sock = self.connect_to_coordinator()
 
     def connect_to_coordinator(self):
         print("Attempting to connect to coordinator")
@@ -188,7 +202,7 @@ class Worker:
             new_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             # Disable Nagle's Algorithm
             new_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            new_sock.settimeout(5)
+            new_sock.settimeout(None)
                     
             new_sock.connect((host, port))
 
@@ -228,8 +242,9 @@ class Worker:
     # ---------------------------------------------------------------------------
     def get_stats(self):
         stats =  {
-            "type": "heartbeat",
-            "worker_name": self.worker_name,
+            "method": "heartbeat",
+            "type": "worker",
+            "id": self.worker_name,
             "cpu_load": self.cpu_load(),
             "free_main_mem_mb": self.free_main_mem_mb(),
             "free_disk_mem_gb": self.free_disk_mem_gb(),
@@ -274,6 +289,9 @@ class Worker:
     def run(self):
         data = b""
         while True:
+            if self.reset_signal.is_set():
+                self.reset()
+
             # Get new message
             try:
                 # Read message (blocks)
@@ -282,29 +300,32 @@ class Worker:
             except ConnectionError:
                 data = b""
 
-            if not data:
-                print("Coordinator broke connection. Attempting to reconnect...")
-                self.connect_to_coordinator()
+            try:
+                if not data:
+                    print("Coordinator broke connection. Resetting...")
+                    raise NetworkError("Network failed during send.")
 
-            # Need at least 4 bytes to know message length
-            if len(data) < 4:
-                continue
+                # Need at least 4 bytes to know message length
+                if len(data) < 4:
+                    continue
 
-            # Read length if available
-            message_len = int.from_bytes(data[:4], "big")
+                # Read length if available
+                message_len = int.from_bytes(data[:4], "big")
 
-            # Check if full message available
-            if len(data) < 4 + message_len:
-                continue
+                # Check if full message available
+                if len(data) < 4 + message_len:
+                    continue
 
-            # Read full message
-            message_bytes = data[4:4+message_len]
+                # Read full message
+                message_bytes = data[4:4+message_len]
 
-            # Remove processed bytes from buffer
-            data = data[4 + message_len:]
+                # Remove processed bytes from buffer
+                data = data[4 + message_len:]
 
-            # Execute request
-            self.execute(message_bytes)
+                # Execute request
+                self.execute(message_bytes)
+            except NetworkError:
+                self.reset_signal.set()
 
     def execute(self, message_bytes):
         """
@@ -323,26 +344,29 @@ class Worker:
                 "value": "Request is not valid JSON"
             }
             with self.req_lock:
-                self.send_message(response, self.req_sock)
+                self.send_message(response, self.req_sock, "req_sock")
 
         # validate fields
+        
         if "method" not in request:
+            print(request)
+            sys.exit()
             response = {
                 "status": "invalid",
                 "message": "Missing method"
             }
             with self.req_lock:
-                self.send_message(response, self.req_sock)
+                self.send_message(response, self.req_sock, "req_sock")
             return
         
         # Perform operation
         match request["method"]:
             # Job request
             case "schedule":
-                if self.invalid_args(["zip", "job_id", "command_file"], request):
+                if self.invalid_args(["zip_bytes", "job_id", "script"], request):
                     return
                 
-                zip_data = base64.b64decode(request["zip"])
+                zip_data = base64.b64decode(request["zip_bytes"])
                 task_dir = f"{self.worker_dir}/{request["job_id"]}"
                 zip_path = f"{task_dir}/{request["job_id"]}.zip" # working environment zip file
                 
@@ -355,22 +379,27 @@ class Worker:
                     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                         zip_ref.extractall(task_dir)
 
-                    bash_script = os.path.join(task_dir, request["command_file"])
+                    bash_script = os.path.join(task_dir, request["script"])
                     os.chmod(bash_script, 0o755)
 
                     process = subprocess.Popen(
-                        ["bash", bash_script],
-                        cwd=task_dir
+                        ["bash", request["script"]],
+                        cwd=task_dir,
+                        stdout=subprocess.PIPE,  # Redirect output to our code
+                        stderr=subprocess.PIPE   # Redirect errors to our code
                     )
 
                     with self.jobs_lock:
                         self.running_jobs[request["job_id"]] = process 
 
                     response = {
-                        "type": "ack",
-                        "status": "scheduled",
+                        "type": "worker",
+                        "method": "ack",
+                        "ack_type": "schedule",
+                        "status": "success",
                         "job_id": request["job_id"]
                     }
+                    print("sending ack to coordinator")
                 except Exception as e:
                     response = {
                         "status": "error",
@@ -420,7 +449,8 @@ class Worker:
                 }
             
         with self.req_lock:
-            self.send_message(response, self.req_sock)
+            print("sending message to coord")
+            self.send_message(response, self.req_sock, "req_sock")
         
     def invalid_args(self, args, request):
         for arg in args:
@@ -430,7 +460,7 @@ class Worker:
                     "message": f"invalid, {arg} not present"
                 }
                 with self.req_lock:
-                    self.send_message(response, self.req_sock)
+                    self.send_message(response, self.req_sock, "req_sock")
                 return True
         return False
 
@@ -477,12 +507,21 @@ class Worker:
         return False
     
     def heartbeat(self):
-        with self.req_lock:
-            self.send_message(self.get_stats(), self.req_sock)
+        while not self.reset_signal.is_set():
+            try:
+                with self.req_lock:
+                    self.send_message(self.get_stats(), self.req_sock, "req_sock")
+            except NetworkError:
+                self.reset_signal.set()
+                continue
 
-        time.sleep(HEARTBEAT_INTERVAL)
+            print("Sent heartbeat")
 
-    def send_message(self, message, sock):
+            time.sleep(HEARTBEAT_INTERVAL)
+        
+        print("Network error, heartbeat thread stopped")
+
+    def send_message(self, message, sock, sock_type):
         # send response
         pre_response = json.dumps(message).encode("utf-8")
         response_length = len(pre_response).to_bytes(4, byteorder="big")
@@ -492,51 +531,92 @@ class Worker:
         while True:
             try:
                 sock.sendall(final_response)
+                print(f"sent {final_response}")
                 break
             except (socket.error, BrokenPipeError) as e:
                 print(f"Worker Network Error: {e}")
                 
-                self.start_sock(sock)
+                raise NetworkError("Network failed during send.")
         
     def res_thread(self):
         """
         Send responses from queue
         """
-        while True:
+        while not self.reset_signal.is_set():
             time.sleep(0.5)
-
+            print("checking processes")
+            
+            # 1. Get a list of IDs to check to minimize lock time
             with self.jobs_lock:
-                check_jobs = self.running_jobs.copy()
+                job_ids = list(self.running_jobs.keys())
 
-                for job_id, job in check_jobs.items():
-                    exit_code = job.poll()
+            for job_id in job_ids:
+                with self.jobs_lock:
+                    # Double check it wasn't removed by another thread
+                    if job_id not in self.running_jobs:
+                        continue
+                    job_proc = self.running_jobs[job_id]
 
-                    if exit_code is not None:
-                        stdout, stderr = job.communicate()
+                # 2. Check if finished without blocking
+                exit_code = job_proc.poll()
 
-                        message = {
-                            "type": "job output",
-                            "job_id": job_id,
-                            "stdout": stdout,
-                            "stderr": stderr,
-                            "exit_code": exit_code
-                        }
+                if exit_code is not None:
+                    print("process finished, sending output")
+                    # 3. Capture the output now that we know it's done
+                    stdout_bytes, stderr_bytes = job_proc.communicate()
+                    
+                    # Convert bytes to string for JSON
+                    stdout_text = stdout_bytes.decode('utf-8', errors='replace')
+                    stderr_text = stderr_bytes.decode('utf-8', errors='replace')
 
-                        # Send output
-                        self.send_message(message, self.res_sock)
+                    zip_bytes = self.get_zip_bytes(f"{self.worker_dir}/{job_id}")
 
-                        # Retry until we receive ack (idempotent)
-                        while not self.recv_ack(self.res_sock, "res_sock"):
-                            self.start_sock(self.res_sock, "res_sock")
-                            self.send_message(message, self.res_sock)
+                    encoded_bytes = base64.b64encode(zip_bytes).decode('utf-8')
 
-                        # Remove job
-                        with self.jobs_lock:
-                            if job in self.running_jobs:
-                                del self.running_jobs[job_id]
+                    message = {
+                        "type": "worker",
+                        "method": "output",
+                        "id": self.worker_name,
+                        "job_id": job_id,
+                        "stdout": stdout_text,
+                        "stderr": stderr_text,
+                        "exit_code": exit_code,
+                        "zip_bytes": encoded_bytes
+                    }
+
+                    # Send output
+                    try:
+                        self.send_message(message, self.res_sock, "res_sock")
+
+                        # Receive ack
+                        if not self.recv_ack(self.res_sock, "res_sock"):
+                            raise NetworkError("Network failed during send.")
+                    except NetworkError:
+                        self.reset_signal.set()
+
+                    # Remove job
+                    with self.jobs_lock:
+                        del self.running_jobs[job_id]
+        
+        print("Network error, res_thread stopped")
+
+    
+
+    def get_zip_bytes(self, directory_path):
+        # Create in-memory file-like object
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for root, _, files in os.walk(directory_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.relpath(file_path, directory_path)
+                    zf.write(file_path, arcname)
+        
+        # Grab the bytes from the buffer
+        return zip_buffer.getvalue()
 
 """
-
 Initialization:
 Worker starts
 Worker checks name server for coordinator

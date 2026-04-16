@@ -163,8 +163,9 @@ def zip_directory(dir_path: str) -> bytes:
 
     return buf.getvalue()
 
-
-def extract_zip(zip_bytes: bytes, job_id: str) -> None:
+# Rene: I added out_dir because it wasn't defined, did you mean to pass in out_dir
+# as an arg?
+def extract_zip(zip_bytes: bytes, job_id: str, out_dir) -> None:
     os.makedirs(f'./results_{job_id}', exist_ok=True)
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         zf.extractall(out_dir)

@@ -1,0 +1,113 @@
+Format for sending messages
+
+Coordinator Responses to both Client and Worker
+Must AT LEAST include:
+response = {
+    "status": "ok" | "error",
+    "tag": "type of operation",
+    "message": "message"
+}
+
+Any request must include:
+request = {
+    "method": any of stop, schedule, register, stats,
+    any extra args: "job_id", "zip_data", "script"
+}
+
+Explanatoin:
+- "status": it only indicates if the request succeeded or failed. Can't be anything other than "ok" or "error"
+- "tag": it is specific to the type of message. If the coordinator is scheduling a job with a worker, tag will be "submit",
+if it's sending the output of a job to a client, then the tag could be "output", etc.
+- "message": Provides an extra textual description of the operation in case we want to debug or in case we want to print it 
+out for the client to analyze. For example, instead of telling the client, status error, tag submit job, we could print
+the message which will be more human readable, and it will also have a more detailed description of the failure.
+- may include other fields such as "job_id", or else, if necessary and must be consistent 
+
+Coordinator to anyone:
+response = {
+    "status": "error",
+    "tag": "json",
+    "message": "Request is not valid JSON"
+}
+
+response = {
+    "status": "error",
+    "tag": "type",
+    "message": "You must specify if you're a client or worker in the request"
+}
+
+response = {
+    "status": "error",
+    "tag": "arg",
+    "message": f"invalid, {arg} not present"
+}
+
+----------------------------------------------------------------------------------------------------------------------
+
+Coordinator to Worker:
+
+** Responses **
+response = {
+    "status": "error",
+    "tag": "ack",
+    "message":  "Received unexpected ack"
+}
+
+response = {
+    "status": "error",
+    "tag": "method",
+    "message":  "Invalid method requested"
+}
+
+** Requests **
+request = {
+    "method": "stop",
+    "job_id": job_id
+}
+
+----------------------------------------------------------------------------------------------------------------------
+
+Worker to Coordinator
+
+
+
+
+----------------------------------------------------------------------------------------------------------------------
+
+Coordinator to Client:
+
+response = {
+    "status": "ok",
+    "tag": "stop",
+    "job_id": job_id,
+    "message":  f"{job_id} has been stopped"
+}
+
+response = {
+    "status": "ok",
+    "tag": "submit",
+    "message":  f"Job request {job_name} received and processesd"
+}
+
+response = {
+    "status": "ok",
+    "tag": "stop_ack",
+    "job_id": job_id,
+    "message":  f"Job request to stop {job_id} received and processesd"
+}
+
+response = {
+    "status": "ok",
+    "tag": "register",
+    "message": f"Registered as {id}"
+}
+
+response = {
+    "status": "ok",
+    "tag": "stats",
+    "message": jobs
+}
+
+----------------------------------------------------------------------------------------------------------------------
+
+Client to Coordinator:

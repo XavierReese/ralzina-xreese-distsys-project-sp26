@@ -14,6 +14,7 @@ import os
 import select
 import base64
 from collections import deque
+import uuid
 
 COORDINATOR_TYPE = "coordinator"
 COORDINATOR_PROJECT = "dist_job_coordinator"
@@ -23,40 +24,6 @@ CATALOG_PORT = 9097
 
 BUFSIZ = 4096
 MAX_BACKOFF = 64
-
-# ----------------
-# Message Helpers
-# ----------------
-
-def send_message(sock: socket.socket, message: bytes) -> None:
-    """4-byte big-endian length prefix + payload."""
-    sock.sendall(len(message).to_bytes(4, byteorder="big") + message)
-
-
-def recv_message(sock: socket.socket) -> bytes:
-    """Read a framed message off the socket. Raises ConnectionError on close."""
-    raw_len = _recv_exact(sock, 4)
-    return _recv_exact(sock, int.from_bytes(raw_len, byteorder="big"))
-
-
-def _recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("Connection closed unexpectedly.")
-        buf.extend(chunk)
-    return bytes(buf)
-
-def identify_peer(first_msg):
-    '''
-    identify first message as either client or worker
-    '''
-    if first_msg[:4] == "JOIN":
-        return "client", first_msg.decode("utf-8", errors="replace")
-
-    else:
-        return "worker", None #TODO parse and return worker message
 
 # -------------------
 # Coordinator
@@ -74,7 +41,6 @@ class Coordinator:
         Rene: self.clients doesn't have a specific type structure, the structure should be:
         self.clients = {
             "username": {
-                "socket": <socket_object>,
                 "pending_results": [
                     {"job_id": 101, "status": "finished", ...},
                     ...
@@ -84,7 +50,7 @@ class Coordinator:
         }
         Regardless, I'm not working with clients, just a thought
         """
-        self.clients = {"c1": {"fileno": 2}} 
+        self.clients = {} 
         self.client_queue = []
         self.contact_workers = {} # worker_fd -> socket_type, worker_id for epoll
         self.workers = {} # worker_id -> stats for heartbeat
@@ -99,18 +65,8 @@ class Coordinator:
             "result": None              # store stdout, stderr
         }
         """
-        # Testing only
         self.jobs = {} 
-        self.jobs[1] = {
-                    "client_id": "c1",
-                    "worker_id": "w1",     
-                    "status": "not_started",
-                    "script": "start.sh",
-                    "zip_path": "coordinator_jobs/1.zip",
-                    "result": None  
-                }
-        self.job_queue = deque([1])
-        self.next_job_id = 0
+        self.job_queue = deque()
 
         self.lock = threading.Lock() # separate threads for clients & workers use this to lock coord state
 
@@ -151,18 +107,9 @@ class Coordinator:
         self.log_count = 0
 
         # Start epoll and connections
-        # Testing, should just be = {}
-        self.connections = {
-            2: {
-                "socket": None,
-                "sock_type": "client",      # both client & worker use two sockets, this tells you what socket it is
-                "id": None,             # either username or worker_id
-                "type": None,           # either worker or client
-                "recv_buffer": b"",
-                "send_buffer": b""
-            }
-        }
-        self.send_ack = {}
+        self.connections = {}
+        self.send_ack_worker = {}
+        self.send_ack_client = {}
         self.recv_ack = set()
         self.epoll = select.epoll()
 
@@ -187,7 +134,8 @@ class Coordinator:
         epoll.register(self.server_sock.fileno(), select.EPOLLIN)
 
         connections = self.connections
-        send_ack = self.send_ack # id -> type of ack (did you just register? schedule job with cilent or worker? )
+        send_ack_worker = self.send_ack_worker # id -> type of ack (did you just register? schedule job with cilent or worker? )
+        send_ack_client = self.send_ack_client
 
         try:
             while True:         
@@ -202,7 +150,7 @@ class Coordinator:
                         epoll.register(client_socket.fileno(), select.EPOLLIN)
                         connections[client_socket.fileno()] = {
                             "socket": client_socket,
-                            "sock_type": None,      # both client & worker use two sockets, this tells you what socket it is
+                            "sock_type": None,      # worker uses two sockets, this tells you what socket it is, client leaves this as None
                             "id": None,             # either username or worker_id
                             "type": None,           # either worker or client
                             "recv_buffer": b"",
@@ -212,10 +160,6 @@ class Coordinator:
                     elif event & select.EPOLLIN:
                         connection = connections[fileno]
                         client_socket = connection["socket"]
-
-                        # testing
-                        if connection["sock_type"] == "client":
-                            continue
 
                         self.read_buffer(connection)
                         buffer = connection["recv_buffer"]
@@ -238,12 +182,17 @@ class Coordinator:
                                 connections[fileno]["id"] = id
                                 connections[fileno]["type"] = type
                                 connections[fileno]["sock_type"] = sock_type
-                                self.workers[id] = {}
-                                send_ack[id] = {
-                                    "ack_type": "register",
-                                    "type": type,
-                                    "sock_type": sock_type
-                                }
+                                if type == "worker":
+                                    self.workers[id] = {}
+                                    send_ack_worker[id] = {
+                                        "ack_type": "register",
+                                        "sock_type": sock_type
+                                    }
+                                elif type == "client":
+                                    self.clients[id] = {}
+                                    send_ack_client[id] = {
+                                        "ack_type": "register",
+                                    }
                         else:
                             self.handle_request(connections[fileno], fileno)
 
@@ -254,12 +203,12 @@ class Coordinator:
                         if self.send_response(connections[fileno]):
                             if not connections[fileno]["send_buffer"]:
                                 connection = connections[fileno]["id"]
-                                if connection in send_ack:
+                                if connection in send_ack_worker:
 
-                                    if send_ack[connection]["ack_type"] == "register":
-                                        print(f"[COORD] Finished sending OK to {connection} for {send_ack[connection]}.")
+                                    if send_ack_worker[connection]["ack_type"] == "register":
+                                        print(f"[COORD] Finished sending OK to {connection} for {send_ack_worker[connection]}.")
 
-                                        if send_ack[connection]["type"] == "worker" and send_ack[connection]["sock_type"] == "req_sock":
+                                        if send_ack_worker[connection]["sock_type"] == "req_sock":
                                             if connection in self.workers:
                                                 # Example:
                                                 # workers[worker_id] = fileno
@@ -268,7 +217,20 @@ class Coordinator:
                                                 self.workers[connection]["fileno"] = fileno
                                                 print(f"Registered req_sock from {connection}, checking job_queue after we receive heartbeat")
 
-                                    del send_ack[connection]
+                                    del send_ack_worker[connection]
+                                
+                                elif connection in send_ack_client:
+
+                                    if send_ack_client[connection]["ack_type"] == "register":
+                                        print(f"[COORD] Finished sending OK to {connection} for {send_ack_worker[connection]}.")
+
+                                        self.clients[id]["fileno"] = connection["fileno"]
+                                        if len(self.clients[id]["pending_results"]) > 0:
+                                            # TODO Xavier: return pending results as well if there are any available results for this client
+                                            pass
+                                        else:
+                                            self.clients[id]["pending_results"] = []
+
                                 epoll.modify(fileno, select.EPOLLIN)
                         else:
                             print(f"{connection["id"]} disconnected")
@@ -296,26 +258,27 @@ class Coordinator:
 
         r = None
                 
-        while True:
-            # Need at least 4 bytes to know message length
-            if len(buffer) < 4:
-                break
+        # Need at least 4 bytes to know message length
+        if len(buffer) < 4:            
+            # Rene: is this necessary? print('[DEBUG] coord handle_request: not enough for msg length')
+            return None
 
-            # Read length if available
-            message_len = int.from_bytes(buffer[:4], "big")
+        # Read length if available
+        message_len = int.from_bytes(buffer[:4], "big")
 
-            # Check if full message arrived:
-            if len(buffer) < 4 + message_len:
-                break
+        # Check if full message arrived:
+        if len(buffer) < 4 + message_len:
+            # Rene: is this necessary? print('[DEBUG] coord handle_request: incomplete message received')
+            return None
 
-            # Read full message
-            message_bytes = buffer[4:4+message_len]
+        # Read full message
+        message_bytes = buffer[4:4+message_len]
 
-            # Remove processed bytes from buffer
-            buffer = buffer[4 + message_len:]
+        # Remove processed bytes from buffer
+        buffer = buffer[4 + message_len:]
 
-            # Execute request
-            r = self.execute(message_bytes, connection, fileno)
+        # Execute request
+        r = self.execute(message_bytes, connection, fileno)
 
         # Save remaining data to be handled later
         connection["recv_buffer"] = buffer
@@ -338,13 +301,14 @@ class Coordinator:
             i += 1
     
     def execute(self, message_bytes, connection, fileno):
-        print(message_bytes)
+
         try:
             request = json.loads(message_bytes.decode("utf-8"))
         
         except (TypeError, ValueError):
             response = {
-                "status": "invalid",
+                "status": "error",
+                "tag": "json",
                 "message": "Request is not valid JSON"
             }
             self.schedule_response(response, connection, fileno)
@@ -352,10 +316,10 @@ class Coordinator:
 
         # validate fields
         if "type" not in request:
-            print(request)
             response = {
-                "status": "invalid",
-                "message": "You must specify if you're a client or worker in request['type']"
+                "status": "error",
+                "tag": "type",
+                "message": "You must specify if you're a client or worker in the request"
             }
 
             self.schedule_response(response, connection, fileno)
@@ -375,7 +339,8 @@ class Coordinator:
 
                         response = {
                             "status": "ok",
-                            "message": "Registered"
+                            "tag": "register",
+                            "message": "Registration successful!"
                         }
 
                         self.schedule_response(response, connection, fileno)
@@ -400,7 +365,7 @@ class Coordinator:
                         print(f"[COORD] Received heartbeat from {request["type"]} {id}")
 
                         if len(self.job_queue) > 0:
-                            print(f"Trying to clear job_queue with {id}")
+                            print(f"Trying to clear job_queue with addition of {id}")
                             self.clear_job_queue()
 
                     case "ack":
@@ -411,7 +376,7 @@ class Coordinator:
                             job_id = request["job_id"]
                             
                             if request["ack_type"] == "schedule":
-                                if request["status"] == "success":
+                                if request["status"] == "ok":
                                     self.jobs[job_id]["status"] = "running"
                                 else:
                                     job = self.jobs[job_id]
@@ -419,11 +384,19 @@ class Coordinator:
                                     self.schedule_job(job["client_id"], job["script"], job["zip_path"])
                             
                             if request["ack_type"] == "stop":
-                                if request["status"] == "success":
+                                if request["status"] == "ok":
                                     try:
                                         del self.jobs[job_id]
                                     except KeyError:
                                         pass
+                                    # Tell client that you have stopped the process
+                                    response = {
+                                        "status": "ok",
+                                        "tag": "stop",
+                                        "job_id": job_id,
+                                        "message":  f"{job_id} has been stopped"
+                                    }
+                                    self.schedule_response(response, connection, fileno)
                                 else:
                                     request = {
                                         "method": "stop",
@@ -434,6 +407,7 @@ class Coordinator:
                         else:
                             response = {
                                 "status": "error",
+                                "tag": "ack",
                                 "message":  "Received unexpected ack"
                             }
                             self.schedule_response(response, connection, fileno)
@@ -454,13 +428,17 @@ class Coordinator:
 
                         # del self.jobs[job_id]
 
+                        # Check job queue and try to rerun unrun jobs
+
+                        # Do we need a client queue or can we just schedule response?
                         self.client_queue.append(self.jobs[request["job_id"]]["client_id"])
 
                         print("Attempting to send result to client...")
 
                     case _:
                         response = {
-                            "status": "invalid",
+                            "status": "error",
+                            "tag": "method",
                             "message":  "Invalid method requested"
                         }
                         self.schedule_response(response, connection, fileno)
@@ -468,44 +446,15 @@ class Coordinator:
             case "client":
                 # Handle each possible client operation
                 match request["method"]:
-                    case "schedule":
-                        if self.invalid_args(["zip_file", "script", "id"], request, connection, fileno):
-                            return
-
-                        job_id = self.next_job_id
-                        self.next_job_id += 1
-
-                        zip_path = os.path.join(self.jobs_dir, f"{job_id}.zip")
-
-                        encoded_zip = request["zip_file"]
-                        zip_bytes = base64.b64decode(encoded_zip)
-
-                        try:
-                            with open(zip_path, "wb") as f:
-                                f.write(zip_bytes)
-                            print(f"Saved zip file to {zip_path}")
-                        except Exception as e:
-                            print(f"Failed to write zip file {zip_path}: {e}")
-
-
-                        # Send ack to client that you received and processed request
-                        response = {
-                            "status": "ok",
-                            "message":  f"Job request {job_id} received and processesd"
-                        }
-                        self.schedule_response(response, connection, fileno)
-
-                        # contact a worker
-
-                        self.schedule_job(fileno, request["script"], zip_path)
-
                     case "stop":
                         if self.invalid_args(["id"], request, connection, fileno):
                             return
 
                         response = {
                             "status": "ok",
-                            "message":  f"Job request {job_id} received and processesd"
+                            "tag": "stop_ack",
+                            "job_id": job_id,
+                            "message":  f"Job request to stop {job_id} received and processesd"
                         }
                         self.schedule_response(response, connection, fileno)
 
@@ -522,20 +471,116 @@ class Coordinator:
 
                         self.recv_ack.add(worker_fd)
 
-                    case _:
+                    case "register":
+                        if self.invalid_args(["username"], request, connection, fileno):
+                            return
+
+                        id = request["username"]
+                        sock_type = None
+                        type = request["type"]
+
                         response = {
-                            "status": "invalid",
-                            "message":  "Invalid method requested"
+                            "status": "ok",
+                            "tag": "register",
+                            "message": f"Registered as {id}"
+                        }
+
+                        print(f'[CLIENT_JOIN] client {id} joined')
+
+                        return id, None, type
+
+                    case "ack":
+                        # TODO implement function when coordinator must receive an ack from client
+                        # Look at case "ack" above in worker for reference
+                        pass
+
+                    case "stats":
+
+                        if self.invalid_args(["username"], request, connection, fileno):
+                            return
+
+                        username = request["username"]
+
+                        # Rene: do we really need to check this? I added the ack check on registration so I don't think this 
+                        # error would hapen
+                        if username not in self.clients:
+                            self.error_res("Please JOIN first", "register", connection, fileno)
+                            return
+
+                        # Rene: I don't think this error would happen either, the fileno is associated to the connection,
+                        # and the connection has the username, so I think it's extra
+                        if fileno != self.clients[username]["fileno"]:
+                            self.error_res(f'Socket not associated with {username}, please leave and rejoin', "register",connection, fileno)
+
+
+                        jobs = []
+                        # Send (job_id, status)
+                        for job_id in self.clients[username]["pending"]:
+                            status = self.jobs[job_id]["status"]
+                            name = self.jobs[job_id]["name"]
+                            jobs.append([name, status])
+
+                        #print(f'DEBUG: JOBS: {jobs}')
+                        response = {
+                            "status": "ok",
+                            "tag": "stats",
+                            "message": jobs
+                        }
+                        self.schedule_response(response, connection, fileno)
+                        return
+
+                    case "submit":
+                        if self.invalid_args(["zip_file", "script", "name"], request, connection, fileno):
+                            return
+
+                        job_id = str(uuid.uuid4())
+
+                        zip_path = os.path.join(self.jobs_dir, f"{job_id}.zip")
+
+                        encoded_zip = request["zip_file"]
+                        zip_bytes = base64.b64decode(encoded_zip)
+
+                        name = request["name"]
+                        script = request["script"]
+
+                        try:
+                            with open(zip_path, "wb") as f:
+                                f.write(zip_bytes)
+                            print(f"Saved zip file to {zip_path}")
+                        except Exception as e:
+                            print(f"Failed to write zip file {zip_path}: {e}")
+
+                        response = {
+                            "status": "ok",
+                            "tag": "submit",
+                            "message":  f"Job request {name} received and started"
                         }
                         self.schedule_response(response, connection, fileno)
 
-    
-    def schedule_job(self, client_id, script, zip_path, job_id=None):
+                        # contact a worker
+
+                        self.schedule_job(fileno, script, zip_path, name, job_id)
+
+                    case _:
+                        response = {
+                            "status": "error",
+                            "tag": "method",
+                            "message":  "Invalid method requested"
+                        }
+                        self.schedule_response(response, connection, fileno)
+            case _:
+                response = {
+                    "status": "error",
+                    "tag": "type",
+                    "mesasge": "Must specify if type is client or worker only"
+                }
+
+
+    def schedule_job(self, client_id, script, zip_path, name, job_id=None):
         # Logic to select which worker to run
 
         if not job_id:
-            job_id = self.next_job_id
-            self.next_job_id += 1
+            job_id = str(uuid.uuid4())
         
         for worker_id in self.select_worker():
             print(f"Trying to schedule {job_id} in {worker_id}")
@@ -548,7 +593,8 @@ class Coordinator:
                     "status": "not_started",
                     "script": script,
                     "zip_path": zip_path,
-                    "result": None  
+                    "result": None,
+                    "name": name
                 }
 
                 try:
@@ -617,12 +663,22 @@ class Coordinator:
         for arg in args:
             if arg not in request:
                 response = {
-                    "status": "invalid",
+                    "status": "error",
+                    "tag": "arg",
                     "message": f"invalid, {arg} not present"
                 }
                 self.schedule_response(response, connection, fileno)
                 return True
         return False
+    
+    def error_res(self, err_message: str, tag: str, connection, fileno):
+        ''' Schedule an error response '''
+        response = {
+            "status": "error",
+            "tag": tag,
+            "message": err_message
+        }
+        self.schedule_response(response, connection, fileno)
     
     def schedule_response(self, response, connection, fileno):
         try:
@@ -650,6 +706,26 @@ class Coordinator:
             except socket.error as e:
                 print(f"[COORD] Network Error: Failed to send response: {e}")
                 return False # network error, client disconnected
+
+    # -----------------------------------
+    # State Updating Functions
+    # - standardize adding/removing jobs, etc
+    # Rene: remove? check my own schedule logic
+    # -----------------------------------
+
+    def incoming_job(self, username, script, outputs, dir_zip):
+        job_id = str(uuid.uuid4())
+        self.jobs[job_id] = {
+            "client_id": username,
+            "worker_id": None,     # or None if not scheduled / rescheduled,
+            "status": "not_started",
+            "script": script,        # script to run program
+            "output_files": outputs,
+            "zip": dir_zip,
+            "result": None          # store stdout, stderr
+        }
+        
+        return job_id
 
     # ------------------------------------
     # Catalog Update
@@ -680,92 +756,6 @@ class Coordinator:
             catalog_s.close()
             time.sleep(60)
 
-    # ----------------------------------
-    # Accept Loop
-    # - waits for new connection
-    # - identify client or worker
-    # - create handler thread
-    # ---------------------------------
-
-    def _accept_loop(self) -> None:
-        while True:
-            conn, addr = self.server_sock.accept()
-            threading.Thread(
-                target=self._identify_and_dispatch,
-                args=(conn, addr),
-                daemon=True
-            ).start()
-
-    def _identify_and_dispatch(self, conn: socket.socket, addr) -> None:
-        """
-        - Identify connection as client or worker using first message
-        - Send to correct handler loop
-        """
-        try:
-            first_msg = recv_message(conn)
-        except ConnectionError:
-            conn.close()
-            return
-
-        peer_type, parsed = identify_peer(first_msg)
-
-        if peer_type == "client":
-            self._handle_client_connection(conn, addr, parsed)
-        else:
-            self._handle_worker_connection(conn, addr, parsed)
-
-    # ------------------------
-    # Client Handler
-    # - runs on its own thread per client
-    # - started by accept_loop
-    # ------------------------
-
-    def _handle_client_connection(self, conn: socket.socket, addr, join_text: str) -> None:
-        """
-        Runs on its own thread for each client connection.
- 
-        On connect:
-          1. Parse JOIN <username>
-          2. Register (or re-register) the client socket
-          3. Flush any pending results that arrived while they were offline
-          4. Loop reading commands until the socket closes
- 
-        Commands:
-          SUBMIT_JOB <username> <exec_script> <out1,out2,...>\n<zip bytes>
-          JOB_STATS  <username>
-        """
-        # Parse JOIN
-        parts    = join_text.strip().split(" ", 1)
-        username = parts[1] if len(parts) > 1 else join_text.strip()
- 
-        print(f"[CLIENT] {username} connected from {addr}")
- 
-        with self.lock:
-            if username not in self.clients:
-                self.clients[username] = {"sock": conn, "pending_results": []} # register new client
-            else:
-                self.clients[username]["sock"] = conn # update socket of re-connected client
-
-        self._send_pending_results(username) # TODO
-
-        # Send OK greeting
-        try:
-            send_message(conn, json.dumps({"status": "ok", "message": "hello"}).encode())
-        except OSError:
-            self._disconnect_client(username) # TODO
-            return
-
-        # Command loop - rcv commands from client
-        while True:
-            try:
-                message = recv_message(conn)
-            except ConnectionError:
-                break
-
-            self._handle_client_message(username, conn, message)
-
-        self._disconnect_client(username) # TODO
-
     # -----------------------------------------------------------------------
     # Persistence — checkpoint + transaction log
     # -----------------------------------------------------------------------
@@ -784,7 +774,6 @@ class Coordinator:
                     ckpt = json.load(f)
                 self.jobs        = ckpt.get("jobs", {})
                 self.clients     = ckpt.get("clients", {})
-                self.next_job_id = ckpt.get("next_job_id", 0)
 
                 # Note: workers must reconnect
                 self.workers = {}
@@ -820,7 +809,6 @@ class Coordinator:
         if event == "queued" and "job" in entry:
             job = entry["job"]
             self.jobs[job["job_id"]] = job
-            self.next_job_id = max(self.next_job_id, int(job["job_id"]) + 1)
         elif event == "dispatched" and job_id:
             if job_id in self.jobs:
                 self.jobs[job_id]["status"] = "running"
@@ -856,7 +844,6 @@ class Coordinator:
                 "jobs":        self.jobs,
                 "clients":     {u: {"pending_results": c["pending_results"]}
                                 for u, c in self.clients.items()},
-                "next_job_id": self.next_job_id,
             }
  
         tmp = self.ckpt_path + ".tmp"
@@ -894,3 +881,20 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+"""
+Rene:
+Personal notes:
+- Don't do anything until you have sent the ack
+If a client registers, and you register the client in self.clients, but
+then ack fails, now you have to clean up all what you already started
+doing for that client, so it's better to just wait until you sent the
+ack and you know the sending succeeded.
+
+- Should we add a job_name? when client submits a job, if we make the job_id
+be a uuid then if client requests stats that would be 23453425352342 but is it
+better for client to submit a job with a job_name for when they request stats?
+I added a field to self.jobs of self.jobs["name"] with the job_name and made it
+required for the client to submit a job name when submitting a job
+"""

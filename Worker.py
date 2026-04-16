@@ -491,7 +491,7 @@ class Worker:
             try:
                 response = json.loads(resp_bytes.decode("utf-8"))
                     
-                if response["status"] == "failed":
+                if response["status"] == "error":
                     print(f"{sock_type}: ack failed")
                     return False
                 else:

@@ -562,12 +562,6 @@ class Worker:
 
                 if exit_code is not None:
                     print("process finished, sending output")
-                    # 3. Capture the output now that we know it's done
-                    stdout_bytes, stderr_bytes = job_proc.communicate()
-                    
-                    # Convert bytes to string for JSON
-                    stdout_text = stdout_bytes.decode('utf-8', errors='replace')
-                    stderr_text = stderr_bytes.decode('utf-8', errors='replace')
 
                     zip_bytes = self.get_zip_bytes(f"{self.worker_dir}/{job_id}")
 
@@ -578,9 +572,6 @@ class Worker:
                         "method": "output",
                         "id": self.worker_name,
                         "job_id": job_id,
-                        "stdout": stdout_text,
-                        "stderr": stderr_text,
-                        "exit_code": exit_code,
                         "zip_bytes": encoded_bytes
                     }
 

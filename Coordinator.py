@@ -413,16 +413,37 @@ class Coordinator:
                             self.schedule_response(response, connection, fileno)
 
                     case "output":
-                        if self.invalid_args(["zip_bytes", "job_id", "stdout", "stderr", "exit_code", "id"], request, connection, fileno):
+                        if self.invalid_args(["zip_bytes", "job_id", "exit_code", "id"], request, connection, fileno):
                             return
 
                         print(f"Recieved output from {request["id"]} for job {request["job_id"]}")
-                        print("Output:")
-                        print(f"stdout: {request["stdout"]}")
-                        print(f"stderr: {request["stderr"]}")
-
 
                         print("Saving to disk...")
+
+                        job_id = request["job_id"]
+
+                        zip_path = os.path.join(self.jobs_dir, f"{job_id}_output.zip")
+                        encoded_zip = request["zip_file"]
+                        zip_bytes = base64.b64decode(encoded_zip)
+
+                        try:
+                            with open(zip_path, "wb") as f:
+                                f.write(zip_bytes)
+                            print(f"Saved zip file to {zip_path}")
+                        except Exception as e:
+                            print(f"Failed to write zip file {zip_path}: {e}")
+
+                        try:
+                            with open(zip_path, "rb") as f:
+                                zip_bytes = f.read()
+                        except FileNotFoundError:
+                            print(f"Error: The file at {zip_path} was not found.")
+                            return 
+                        except Exception as e:
+                            print(f"An unexpected error occurred when scheduling {client_id}_{job_id}: {e}")
+                            return 
+                        
+                        encoded_bytes = base64.b64encode(zip_bytes).decode('utf-8')
                         
                         # self.log(all of this information to log file)
 
@@ -546,20 +567,27 @@ class Coordinator:
                         try:
                             with open(zip_path, "wb") as f:
                                 f.write(zip_bytes)
+
                             print(f"Saved zip file to {zip_path}")
+                            response = {
+                                "status": "ok",
+                                "tag": "submit",
+                                "message":  f"Job request {name} received and started"
+                            }
+                            self.schedule_response(response, connection, fileno)
+
+                            # contact a worker
+
+                            self.schedule_job(fileno, script, zip_path, name, job_id)
                         except Exception as e:
                             print(f"Failed to write zip file {zip_path}: {e}")
 
-                        response = {
-                            "status": "ok",
-                            "tag": "submit",
-                            "message":  f"Job request {name} received and started"
-                        }
-                        self.schedule_response(response, connection, fileno)
-
-                        # contact a worker
-
-                        self.schedule_job(fileno, script, zip_path, name, job_id)
+                            response = {
+                                "status": "error",
+                                "tag": "submit",
+                                "message":  f"Failed to process submit request"
+                            }
+                            self.schedule_response(response, connection, fileno)
 
                     case _:
                         response = {
@@ -617,7 +645,7 @@ class Coordinator:
                 }
                 print(f"about to schedule message to worker to execute job {request}")
                 self.schedule_response(request, self.connections[worker_fd], worker_fd)
-                print("scheduled message iwth job")
+                print("scheduled message with job")
                 self.recv_ack.add(worker_fd)
                 print("expecting worker ack")
 

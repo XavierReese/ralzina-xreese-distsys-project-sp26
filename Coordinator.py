@@ -525,7 +525,6 @@ class Coordinator:
                             "job_id": job_id,
                             "message":  f"Job request to stop {job_id} received and processesd"
                         }
-                        self.schedule_response(response, connection, fileno)
 
                         self.jobs[job_id]["status"] = "stop"
 
@@ -539,6 +538,8 @@ class Coordinator:
                         self.schedule_response(request, self.connections[worker_fd], worker_fd)
 
                         self.recv_ack_worker.add(worker_fd)
+
+                        self.schedule_response(response, connection, fileno)
 
                     case "register":
                         if self.invalid_args(["username"], request, connection, fileno):
@@ -663,6 +664,7 @@ class Coordinator:
                             response = {
                                 "status": "ok",
                                 "tag": "submit",
+                                "job_id": job_id,
                                 "message":  f"Job request {name} received and started"
                             }
                             self.schedule_response(response, connection, fileno)

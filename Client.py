@@ -115,12 +115,12 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 # Connection helper
 # - calls discover_coordinator
 # - open TCP
-# - send JOIN
+# - send register request
 # ---------------------------------------------------------------------------
 
 def connect_to_coordinator(username: str) -> socket.socket:
     """
-    Discover the coordinator, open a TCP connection, and send JOIN <username>.
+    Discover the coordinator, open a TCP connection, and send register request
     Retries indefinitely on failure (re-discovering via catalog each time).
     """
     while True:
@@ -134,10 +134,10 @@ def connect_to_coordinator(username: str) -> socket.socket:
                     "username": username
             }
             send_message(sock, json.dumps(join_msg).encode('utf-8'))
-            print(f"[JOIN] Requested to join coordinator as '{username}'")
+            print(f"[REGISTER] Requested to join coordinator as '{username}'")
             return sock
         except OSError as exc:
-            print(f"[JOIN] Connection failed ({exc}), rediscovering ...")
+            print(f"[REGISTER] Connection failed ({exc}), rediscovering ...")
             time.sleep(2)
 
 
@@ -185,7 +185,8 @@ def build_submit_message(username: str,
         "username": username,
         "exec_script": exec_script,
         "outputs": outputs,
-        "zip_data": base64.b64encode(zip_bytes).decode('utf-8')
+        "zip_data": base64.b64encode(zip_bytes).decode('utf-8'),
+        "type": "client"
     }
 
     return json.dumps(message_dict).encode('utf-8')
@@ -196,6 +197,16 @@ def build_stats_message(username: str) -> bytes:
     message_dict = {
         "method": "stats",
         "username": username,
+        "type": "client"
+    }
+
+    return json.dumps(message_dict).encode('utf-8')
+
+def build_stop_message(username: str, job_id: int) -> bytes:
+    message_dict = {
+            "method": "stop",
+            "username": username,
+            "type": "client"
     }
 
     return json.dumps(message_dict).encode('utf-8')
@@ -259,27 +270,44 @@ def _handle_push(session: Session, message: bytes) -> None:
         print(f'[ERROR] Invalid message received from coordinator - no tag: {msg}')
 
     tag = msg.get("tag")
+    ok = msg.get("status", "error") == "ok"
 
     if tag == "error":
         message = msg.get("message", "no error provided")
         print(f'[ERROR] {e}')
-    elif tag == "ack_join":
-        session.connected = True
-        print(f'[JOIN] Successful')
+    elif tag == "register":
+        if ok:
+            session.connected = True
+            print(f'[JOIN] Successful')
     elif tag == "stats":
-        jobs = msg.get("message", [])
-        if len(jobs) == 0:
-            print(f'[STATS] No jobs associated with user {session.username}')
+        if ok:
+            jobs = msg.get("message", [])
+            if len(jobs) == 0:
+                print(f'[STATS] No jobs associated with user {session.username}')
+            else:
+                for j in jobs:
+                    print(f'\n{j}') # TODO prettier printing after format has settled
+    elif tag == "stop_ack":
+        if ok:
+            job_id = msg.get("job_id", "UNKNOWN")
+            print(f'[STOP] request to stop job {job_id} received and acknowledged')
+    elif tag == "stop":
+        if ok:
+            job_id = msg.get("job_id", "UNKNOWN")
+            print(f'[STOP] job {job_id} stopped')
+    elif tag == "submit":
+        if ok:
+            job_id = msg.get("job_id")
+            if not job_id:
+                print(f'[ERROR] Internal Error: No job_id provided by coordinator')
+            else:
+                print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./results_{job_id}')
         else:
-            for j in jobs:
-                print(f'\n{j}') # TODO prettier printing after format has settled
-
-    elif tag == "ack_submit":
-        job_id = msg.get("message")
-        if not job_id:
-            print(f'[ERROR] Internal Error: No job_id provided by coordinator')
-        else:
-            print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./results_{job_id}')
+            print(f'[ERROR] Failed to process job submission')
+    else:
+        if not ok or tag == "error":
+            message = msg.get("message", "no error provided")
+            print(f'[ERROR] {e}')
         
 
     #print(f"\n((client._hand_push)) Message Received: {msg}")
@@ -349,6 +377,12 @@ def handle_stats(session: Session) -> None:
     except OSError as exc:
         print(f"[ERROR] {exc}")
 
+def handle_stop(session: Session, args: argparse.Namespace) -> None:
+    try:
+        send_message(session.sock, build_stop_message(session.username))
+    except OSError as exc:
+        print(f"[ERROR] {exc}")
+
 
 # ---------------------------------------------------------------------------
 # Interactive REPL parser
@@ -367,7 +401,13 @@ def make_repl_parser() -> argparse.ArgumentParser:
                           help="Relative paths inside the job dir to retrieve on completion")
 
     sub.add_parser("stats", exit_on_error=False)
+
+    p_stop = sub.add_parser("stop", exit_on_error=False)
+    p_stop.add_argument("--jobid",     required=True,
+                          help="job id from stats page")
+
     sub.add_parser("quit",  exit_on_error=False)
+
     sub.add_parser("help",  exit_on_error=False)
 
     return parser

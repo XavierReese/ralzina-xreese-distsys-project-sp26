@@ -86,6 +86,7 @@ response = {
 response = {
     "status": "ok",
     "tag": "submit",
+    "job_id": job_id
     "message":  f"Job request {job_name} received and processesd"
 }
 

@@ -18,7 +18,7 @@ and others when coordinator initiates communication (schedule new job), it's eas
 have one socket for each type. Req_sock handles requests from coordinator and sends ack when request is processed.
 Res_sock handles sending job outputs to coordinator expecting an ack from coordinator.
 - Each socket is handled in a separate thread
-- The heartbeat thread shares the req_sock, so we must lock when using it to send only
+- The update thread shares the req_sock, so we must lock when using it to send only
 """
 
 import http.client
@@ -42,7 +42,7 @@ import argparse
 # Worker constants
 MAX_BACKOFF         = 64
 BUFSIZ              = 4096
-HEARTBEAT_INTERVAL  = 60
+UPDATE_INTERVAL  = 60
 MAX_LOG_COUNT       = 100
 MAX_JOBS            = 2
 
@@ -68,7 +68,7 @@ class Worker:
     # - init:
     #   - start with a fresh working directory
     #   - connect to coordinator, send registration and wait for ack
-    #   - startup heartbeat thread and response thread
+    #   - startup update thread and response thread
     # - start_sock: handles all the logic to create a new socket from scratch
     # - connect_to_coordinator: tries to connect to coordinator with backoff
     # - find_coordinator: contacts name server to find coordinator and returns True if it connected, False if not
@@ -79,7 +79,7 @@ class Worker:
         self.worker_dir = f"{self.worker_name}_dir"
 
         self.req_sock = None
-        self.req_lock = threading.Lock() # need a lock to share with heartbeat thread
+        self.req_lock = threading.Lock() # need a lock to share with update thread
         self.res_sock = None
 
         self.jobs_lock = threading.Lock()
@@ -111,10 +111,10 @@ class Worker:
 
         self.reset_signal.clear()
 
-        # Start heartbeat thread
-        heartbeat_thread = threading.Thread(target=self.heartbeat, daemon=True)
-        heartbeat_thread.start()
-        print("Worker heartbeat thread started")
+        # Start update thread
+        update_thread = threading.Thread(target=self.update, daemon=True)
+        update_thread.start()
+        print("Worker update thread started")
 
         # Start message sender thread
         res_thread = threading.Thread(target=self.res_thread, daemon=True)
@@ -242,7 +242,7 @@ class Worker:
     # ---------------------------------------------------------------------------
     def get_stats(self):
         stats =  {
-            "method": "heartbeat",
+            "method": "update",
             "type": "worker",
             "id": self.worker_name,
             "cpu_load": self.cpu_load(),
@@ -468,7 +468,7 @@ class Worker:
     # Messaging Functions
     # - recv_exact: receive exact amount of bytes
     # - recv_ack: receive acknowlegement from coordinator
-    # - heartbeat: thread to send heartbeat to coordinator
+    # - update: thread to send update to coordinator
     # - send_message: send message to coordinator
     # - res_thread: thread that notifies coordinator of finished jobs
     # ---------------------------------------------------------------------------
@@ -506,7 +506,7 @@ class Worker:
 
         return False
     
-    def heartbeat(self):
+    def update(self):
         while not self.reset_signal.is_set():
             try:
                 with self.req_lock:
@@ -515,11 +515,11 @@ class Worker:
                 self.reset_signal.set()
                 continue
 
-            print("Sent heartbeat")
+            print("Sent update")
 
-            time.sleep(HEARTBEAT_INTERVAL)
+            time.sleep(UPDATE_INTERVAL)
         
-        print("Network error, heartbeat thread stopped")
+        print("Network error, update thread stopped")
 
     def send_message(self, message, sock, sock_type):
         # send response
@@ -615,10 +615,10 @@ Worker checks name server for coordinator
 
 coordinator will register worker
 
-worker immediately sends heartbeat after startup and after that it sends it again every 
-HEARTBEAT_INTERVAL seconds
+worker immediately sends update after startup and after that it sends it again every 
+update_INTERVAL seconds
 
-That way workers only send heartbeats based on when they registered so that coordinator is never 
+That way workers only send updates based on when they registered so that coordinator is never 
 overloaded
 
 Client talks to Coordinator and sends zipped working directory

@@ -51,7 +51,7 @@ class Coordinator:
         self.clients = {} 
         self.client_output_queue = set() # Keep track if we must send any output to client
         self.contact_workers = {} # worker_fd -> socket_type, worker_id for epoll
-        self.workers = {} # worker_id -> stats for heartbeat
+        self.workers = {} # worker_id -> stats for update
         """
         Rene: self.clients doesn't have a specific type structure, the structure should be:
         self.workers = {
@@ -117,8 +117,6 @@ class Coordinator:
 
         # Start epoll and connections
         self.connections = {}
-        self.send_ack_worker = {}
-        self.send_ack_client = {}
         self.recv_ack_worker = set()
         self.recv_ack_client = set()
         self.epoll = select.epoll()
@@ -126,12 +124,6 @@ class Coordinator:
         # Catalog Update Heartbeat
         threading.Thread(target=self.update, args=(self.port,), daemon=True).start()
 
-        # Worker Watcher (hears heartbeats and notices dead workers)
-        # TODO
-
-        # Dispatcher (pull from job_queue, send to best worker)
-        # TODO
-        
         # self._accept_loop()
         self.run()
 
@@ -144,8 +136,6 @@ class Coordinator:
         epoll.register(self.server_sock.fileno(), select.EPOLLIN)
 
         connections = self.connections
-        send_ack_worker = self.send_ack_worker # id -> type of ack (did you just register? schedule job with cilent or worker? )
-        send_ack_client = self.send_ack_client
 
         try:
             while True:         
@@ -164,7 +154,8 @@ class Coordinator:
                             "id": None,             # either username or worker_id
                             "type": None,           # either worker or client
                             "recv_buffer": b"",
-                            "send_buffer": b""
+                            "send_queue": deque(),  # queue of messages to be sent
+                            "sent_bytes": 0         # Track progress of current message being sent
                         }
 
                     elif event & select.EPOLLIN:
@@ -193,16 +184,30 @@ class Coordinator:
                                 connections[fileno]["type"] = type
                                 connections[fileno]["sock_type"] = sock_type
                                 if type == "worker":
-                                    self.workers[id] = {}
-                                    send_ack_worker[id] = {
-                                        "ack_type": "register",
-                                        "sock_type": sock_type
+                                    self.workers[id] = {
+                                        "fileno": fileno,
+                                        "running_jobs": set()
                                     }
                                 elif type == "client":
-                                    self.clients[id] = {}
-                                    send_ack_client[id] = {
-                                        "ack_type": "register",
-                                    }
+                                    if id not in self.clients:
+                                        self.clients[id] = {
+                                            "pending_results": [],
+                                            "finished_results": [],
+                                            "fileno": fileno
+                                        }
+                                    else:
+                                        # Send pending results
+                                        for result in self.clients[id]["finished_results"]:
+                                            self.schedule_response(result, connections[fileno], fileno)
+
+                                    # TODO
+                                    # Send stats of running jobs?
+                            else:
+                                print("Error registering socket")
+                                epoll.unregister(fileno)
+                                del connections[fileno]
+                                client_socket.close()
+
                         else:
                             self.handle_request(connections[fileno], fileno)
 
@@ -210,39 +215,30 @@ class Coordinator:
                         connection = connections[fileno]
                         client_socket = connection["socket"]
 
-                        if self.send_response(connections[fileno]):
-                            if not connections[fileno]["send_buffer"]:
-                                connection = connections[fileno]["id"]
-                                if connection in send_ack_worker:
+                        if not self.send_response(connection):
+                            # TODO
+                            # If it was a worker, reschedule all jobs
+                            # If it was a client AND it's a program output, append to client send queue
 
-                                    if send_ack_worker[connection]["ack_type"] == "register":
-                                        print(f"[COORD] Finished sending OK to {connection} for {send_ack_worker[connection]}.")
+                            type = connection["type"]
 
-                                        if send_ack_worker[connection]["sock_type"] == "req_sock":
-                                            if connection in self.workers:
-                                                # Example:
-                                                # workers[worker_id] = fileno
-                                                # We only need to know fileno of req_sock, not res_sock
-                                                # We initiate conversation to worker to send requests
-                                                self.workers[connection]["fileno"] = fileno
-                                                print(f"Registered req_sock from {connection}, checking job_queue after we receive heartbeat")
+                            if type == "client":
+                                failed_msg = connection["send_queue"].popleft()
 
-                                    del send_ack_worker[connection]
-                                
-                                elif connection in send_ack_client:
+                                if "method" in failed_msg and failed_msg["method"] == "output":
+                                    self.clients[connection["id"]]["finished_results"].append(failed_msg)
+                            elif type == "worker":
+                                running_jobs = self.workers[connection["id"]]["running_jobs"]
 
-                                    if send_ack_client[connection]["ack_type"] == "register":
-                                        print(f"[COORD] Finished sending OK to {connection} for {send_ack_worker[connection]}.")
+                                del self.workers[connection["id"]]
 
-                                        self.clients[id]["fileno"] = connection["fileno"]
-                                        if len(self.clients[id]["pending_results"]) > 0:
-                                            # TODO Xavier: return pending results as well if there are any available results for this client
-                                            pass
-                                        else:
-                                            self.clients[id]["pending_results"] = []
+                                for job_id in running_jobs:
+                                    client_id = self.jobs[job_id]["client_id"]
+                                    name = self.jobs[job_id]["name"]
+                                    script = self.jobs[job_id]["script"]
 
-                                epoll.modify(fileno, select.EPOLLIN)
-                        else:
+                                    self.schedule_job(client_id, script, name, job_id)
+
                             print(f"{connection["id"]} disconnected")
                             epoll.unregister(fileno)
                             del connections[fileno]
@@ -250,7 +246,7 @@ class Coordinator:
                             continue
         except Exception as e:
             print(f"[COORD] crashed:",e)
-            raise
+            exit(1)
 
     def read_buffer(self, connection):
         client_socket = connection["socket"]
@@ -357,7 +353,7 @@ class Coordinator:
                         
                         return id, sock_type, type
 
-                    case "heartbeat":
+                    case "update":
                         if self.invalid_args(["id", "cpu_load", "free_main_mem_mb", "free_disk_mem_gb", "available_jobs"], request, connection, fileno):
                             return
                         
@@ -372,7 +368,7 @@ class Coordinator:
                         self.workers[id]["free_disk_mem_gb"] = free_disk_mem_gb
                         self.workers[id]["available_jobs"] = available_jobs
 
-                        print(f"[COORD] Received heartbeat from {request["type"]} {id}")
+                        print(f"[COORD] Received update from {request["type"]} {id}")
 
                         if len(self.job_queue) > 0:
                             print(f"Trying to clear job_queue with addition of {id}")
@@ -815,20 +811,29 @@ class Coordinator:
         self.epoll.modify(fileno, select.EPOLLIN | select.EPOLLOUT)
 
     def send_response(self, connection):
+        queue = connection["send_queue"]
+        if not queue:
+            return True
+
         client_socket = connection["socket"]
-        send_buffer = connection["send_buffer"]
+        curr_msg = queue[0]
+        offset = connection["sent_bytes"]
 
-        if send_buffer:
-            try:
-                sent = client_socket.send(send_buffer)
-                connection["send_buffer"] = send_buffer[sent:]
-                return True
-            except BlockingIOError:
-                return True # try again next EPOLLOUT
+        try:
+            sent = client_socket.send(curr_msg[offset:])
+            connection["sent_bytes"] += sent
 
-            except socket.error as e:
-                print(f"[COORD] Network Error: Failed to send response: {e}")
-                return False # network error, client disconnected
+            if connection["sent_bytes"] == len(curr_msg):
+                queue.popleft()
+                connection["sent_bytes"] = 0
+
+            return True
+        except BlockingIOError:
+            return True # try again next EPOLLOUT
+
+        except socket.error as e:
+            print(f"[COORD] Network Error: Failed to send response: {e}")
+            return False # network error, client disconnected
 
     # -----------------------------------
     # State Updating Functions

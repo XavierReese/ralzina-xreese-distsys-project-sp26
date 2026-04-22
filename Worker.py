@@ -354,7 +354,7 @@ class Worker:
             print(request)
             sys.exit()
             response = {
-                "status": "invalid",
+                "status": "error",
                 "message": "Missing method"
             }
             with self.req_lock:
@@ -381,12 +381,34 @@ class Worker:
                     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                         zip_ref.extractall(task_dir)
 
-                    bash_script = os.path.join(task_dir, request["script"])
-                    os.chmod(bash_script, 0o755)
+                    # After extraction
+                    extracted_items = [
+                        item for item in os.listdir(task_dir) 
+                        if os.path.isdir(os.path.join(task_dir, item))
+                    ]
+
+                    if not extracted_items:
+                        print("No directory found after unzipping file")
+                        response = {
+                            "status": "error",
+                            "message": "Invalid zip"
+                        }
+                        with self.req_lock:
+                            self.send_message(response, self.req_sock, "req_sock")
+
+                    # This is your 'test1' or 'experiment_v2' folder
+                    folder_name = extracted_items[0] 
+                    work_dir = os.path.join(task_dir, folder_name)
+
+                    script = request["script"]
+
+                    full_script_path = os.path.join(work_dir, script)
+
+                    os.chmod(full_script_path, 0o755)
 
                     process = subprocess.Popen(
-                        ["bash", request["script"]],
-                        cwd=task_dir,
+                        ["bash", script],
+                        cwd=work_dir,
                         stdout=subprocess.PIPE,
                         stderr=subprocess.PIPE,
                         text=True
@@ -575,7 +597,27 @@ class Worker:
                     print(f"Process finished with code {exit_code}, stdout {stdout_text} and stderr {stderr_text}")
                     print("process finished, sending output")
 
-                    zip_bytes = self.get_zip_bytes(f"{self.worker_dir}/{job_id}")
+                    task_dir = f"{self.worker_dir}/{job_id}"
+
+                    extracted_items = [
+                        item for item in os.listdir(task_dir) 
+                        if os.path.isdir(os.path.join(task_dir, item))
+                    ]
+
+                    if not extracted_items:
+                        print("No directory found to send output")
+                        response = {
+                            "status": "error",
+                            "message": "Invalid zip"
+                        }
+                        with self.req_lock:
+                            self.send_message(response, self.req_sock, "req_sock")
+
+                    # This is your 'test1' or 'experiment_v2' folder
+                    folder_name = extracted_items[0] 
+                    work_dir = os.path.join(task_dir, folder_name)
+
+                    zip_bytes = self.get_zip_bytes(work_dir)
 
                     encoded_bytes = base64.b64encode(zip_bytes).decode('utf-8')
 
@@ -649,3 +691,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+Fix "status": "error" messages
+"""

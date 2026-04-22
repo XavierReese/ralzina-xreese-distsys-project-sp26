@@ -166,9 +166,9 @@ def zip_directory(dir_path: str) -> bytes:
 
 # Rene: I added out_dir because it wasn't defined, did you mean to pass in out_dir
 # as an arg?
-def extract_zip(zip_bytes: bytes, username: str, name: str) -> None:
+def extract_zip(zip_bytes: bytes, username: str, name: str, job_id: str) -> None:
     os.makedirs(f'./{username}', exist_ok=True)
-    output_path = os.path.join(username, name)
+    output_path = os.path.join(username, f"{name}--{job_id}")
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         zf.extractall(output_path)
 
@@ -322,12 +322,13 @@ def _handle_push(session: Session, message: bytes) -> None:
         if ok:
             name = msg.get("name", "NA")
             print(f"Received output from job {name}")
-            handle_output(session, msg["job_id"])
+            job_id = msg["job_id"]
+            handle_output(session, job_id)
 
             encoded_zip = msg["zip_bytes"]
             zip_bytes = base64.b64decode(encoded_zip)
 
-            extract_zip(zip_bytes, session.username, name)
+            extract_zip(zip_bytes, session.username, name, job_id)
         else:
             name = msg.get("name", "NA")
             print(f"Output for job {name} failed.")
@@ -336,6 +337,7 @@ def _handle_push(session: Session, message: bytes) -> None:
         if not ok or tag == "error":
             message = msg.get("message", "no error provided")
             print(f'[ERROR] {message}')
+
         
 
     #print(f"\n((client._hand_push)) Message Received: {msg}")
@@ -386,12 +388,9 @@ def handle_submit(session: Session, args: argparse.Namespace) -> None:
         print(f"[ERROR] Failed to zip directory: {exc}")
         return
     
-    dir_name = os.path.basename(args.job_dir.rstrip("/")) 
-    exec_script = os.path.join(dir_name, args.exec)
-
     msg = build_submit_message(
         username    = session.username,
-        exec_script = exec_script,
+        exec_script = args.exec,
         # outputs     = outputs,
         zip_bytes   = zip_bytes,
         name        = args.job_name

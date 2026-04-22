@@ -427,7 +427,10 @@ class Worker:
                         del self.running_jobs[job_id]
                     
                     response = {
-                        "status": "success",
+                        "status": "ok",
+                        "type": "worker",
+                        "method": "ack",
+                        "ack_type": "stop",
                         "message": "terminated job",
                         "job_id": job_id
                     }

@@ -180,7 +180,7 @@ def extract_zip(zip_bytes: bytes, username: str, name: str) -> None:
 
 def build_submit_message(username: str,
                          exec_script: str,
-                         outputs: list[str],
+                         # outputs: list[str],
                          zip_bytes: bytes,
                          name: str) -> bytes:
     message_dict = {
@@ -206,11 +206,11 @@ def build_stats_message(username: str) -> bytes:
 
     return json.dumps(message_dict).encode('utf-8')
 
-def build_stop_message(username: str, job_id: int) -> bytes:
+def build_stop_message(job_id: int) -> bytes:
     message_dict = {
             "method": "stop",
-            "username": username,
-            "type": "client"
+            "type": "client",
+            "job_id": job_id
     }
 
     return json.dumps(message_dict).encode('utf-8')
@@ -298,8 +298,8 @@ def _handle_push(session: Session, message: bytes) -> None:
             if len(jobs) == 0:
                 print(f'[STATS] No jobs associated with user {session.username}')
             else:
-                for name, status in jobs:
-                    print(f'\n{name}: {status}') # TODO prettier printing after format has settled
+                for name, status, job_id in jobs:
+                    print(f'\n{name}: {status} with job_id {job_id}') # TODO prettier printing after format has settled
     elif tag == "stop_ack":
         if ok:
             job_id = msg.get("job_id", "UNKNOWN")
@@ -319,14 +319,18 @@ def _handle_push(session: Session, message: bytes) -> None:
         else:
             print(f'[ERROR] Failed to process job submission')
     elif tag == "output":
-        name = msg.get("name", "NA")
-        print(f"Received output from job {name}")
-        handle_output(session, msg["job_id"])
+        if ok:
+            name = msg.get("name", "NA")
+            print(f"Received output from job {name}")
+            handle_output(session, msg["job_id"])
 
-        encoded_zip = msg["zip_bytes"]
-        zip_bytes = base64.b64decode(encoded_zip)
+            encoded_zip = msg["zip_bytes"]
+            zip_bytes = base64.b64decode(encoded_zip)
 
-        extract_zip(zip_bytes, session.username, name)
+            extract_zip(zip_bytes, session.username, name)
+        else:
+            name = msg.get("name", "NA")
+            print(f"Output for job {name} failed.")
 
     else:
         if not ok or tag == "error":
@@ -373,7 +377,7 @@ def handle_submit(session: Session, args: argparse.Namespace) -> None:
         print(f"[ERROR] Not a directory: {args.job_dir}")
         return
 
-    outputs = args.outputs or []
+    # outputs = args.outputs or []
 
     print(f"[INFO] Zipping {args.job_dir} ...")
     try:
@@ -388,7 +392,7 @@ def handle_submit(session: Session, args: argparse.Namespace) -> None:
     msg = build_submit_message(
         username    = session.username,
         exec_script = exec_script,
-        outputs     = outputs,
+        # outputs     = outputs,
         zip_bytes   = zip_bytes,
         name        = args.job_name
     )
@@ -407,7 +411,7 @@ def handle_stats(session: Session) -> None:
 
 def handle_stop(session: Session, args: argparse.Namespace) -> None:
     try:
-        send_message(session.sock, build_stop_message(session.username))
+        send_message(session.sock, build_stop_message(args.job_id))
     except OSError as exc:
         print(f"[ERROR] {exc}")
 
@@ -432,14 +436,14 @@ def make_repl_parser() -> argparse.ArgumentParser:
                           help="Entry-point script relative to the job directory root")
     p_submit.add_argument("--job_name",    required=True,
                           help="Name to identify job"),
-    p_submit.add_argument("--outputs", nargs="*", default=[],
-                          help="Relative paths inside the job dir to retrieve on completion")
+    #p_submit.add_argument("--outputs", nargs="*", default=[],
+                          #help="Relative paths inside the job dir to retrieve on completion")
     
 
     sub.add_parser("stats", exit_on_error=False)
 
     p_stop = sub.add_parser("stop", exit_on_error=False)
-    p_stop.add_argument("--jobid",     required=True,
+    p_stop.add_argument("--job_id",     required=True,
                           help="job id from stats page")
 
     sub.add_parser("quit",  exit_on_error=False)
@@ -449,13 +453,19 @@ def make_repl_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# Removed: [--outputs <path> ...] [--out-dir <dir>] after <name>
+# Removed on line under Zip <dir>: --outputs lists relative paths to retrieve when done (e.g. results/ logs/out.txt).
+#     Results are extracted automatically when the coordinator pushes them back.
+
 HELP_TEXT = """\
 Commands:
-  submit --job_dir <dir> --exec <script> --job_name <name> [--outputs <path> ...] [--out-dir <dir>]
+  submit --job_dir <dir> --exec <script> --job_name <name> 
       Zip <dir> and submit it. --exec is the entry-point script inside the dir.
-      --outputs lists relative paths to retrieve when done (e.g. results/ logs/out.txt).
-      Results are extracted automatically when the coordinator pushes them back.
+      --job_name is a human readable way to refer to that job when stats is called
 
+  stop --job_id <job_id>
+      Stop a running job
+      
   stats
       Query job stats from the coordinator.
 
@@ -506,6 +516,8 @@ def run_session(username: str) -> None:
             handle_submit(session, args)
         elif args.command == "stats":
             handle_stats(session)
+        elif args.command == "stop":
+            handle_stop(session, args)
 
     sock.close()
 

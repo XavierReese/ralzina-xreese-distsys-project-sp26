@@ -42,7 +42,7 @@ import argparse
 # Worker constants
 MAX_BACKOFF         = 64
 BUFSIZ              = 4096
-UPDATE_INTERVAL  = 60
+UPDATE_INTERVAL     = 60
 MAX_LOG_COUNT       = 100
 MAX_JOBS            = 2
 
@@ -323,7 +323,9 @@ class Worker:
                 data = data[4 + message_len:]
 
                 # Execute request
+                print("Executing")
                 self.execute(message_bytes)
+                print("Done executing")
             except NetworkError:
                 self.reset_signal.set()
 
@@ -385,8 +387,9 @@ class Worker:
                     process = subprocess.Popen(
                         ["bash", request["script"]],
                         cwd=task_dir,
-                        stdout=subprocess.PIPE,  # Redirect output to our code
-                        stderr=subprocess.PIPE   # Redirect errors to our code
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True
                     )
 
                     with self.jobs_lock:
@@ -396,7 +399,7 @@ class Worker:
                         "type": "worker",
                         "method": "ack",
                         "ack_type": "schedule",
-                        "status": "success",
+                        "status": "ok",
                         "job_id": request["job_id"]
                     }
                     print("sending ack to coordinator")
@@ -544,7 +547,6 @@ class Worker:
         """
         while not self.reset_signal.is_set():
             time.sleep(0.5)
-            print("checking processes")
             
             # 1. Get a list of IDs to check to minimize lock time
             with self.jobs_lock:
@@ -561,6 +563,13 @@ class Worker:
                 exit_code = job_proc.poll()
 
                 if exit_code is not None:
+                    stdout_bytes, stderr_bytes = job_proc.communicate()
+    
+                    # Convert bytes to string (handling potential empty results)
+                    stdout_text = stdout_bytes.decode('utf-8') if stdout_bytes else ""
+                    stderr_text = stderr_bytes.decode('utf-8') if stderr_bytes else ""
+
+                    print(f"Process finished with code {exit_code}, stdout {stdout_text} and stderr {stderr_text}")
                     print("process finished, sending output")
 
                     zip_bytes = self.get_zip_bytes(f"{self.worker_dir}/{job_id}")

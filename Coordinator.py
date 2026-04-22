@@ -15,6 +15,7 @@ import select
 import base64
 from collections import deque
 import uuid
+import traceback
 
 COORDINATOR_TYPE = "coordinator"
 COORDINATOR_PROJECT = "dist_job_coordinator"
@@ -166,7 +167,7 @@ class Coordinator:
                         buffer = connection["recv_buffer"]
 
                         if not buffer:
-                            print(f"[COORD] {connection["type"]}_{connection["id"]}_{connection["sock_type"]} disconnected")
+                            print(f"[COORD] {connection["type"]}_{connection["id"]} disconnected")
                             # Client broke connection
                             epoll.unregister(fileno)
                             del connections[fileno]
@@ -178,11 +179,18 @@ class Coordinator:
                         # Normal requests don't return anything in handle_request
                         # registration requests return the worker/client data in handle_request
                         if connections[fileno]["id"] == None:
-                            id, sock_type, type = self.handle_request(connections[fileno], fileno)
+                            response = self.handle_request(connections[fileno], fileno)
+
+                            if response == None:
+                                continue
+
+                            id, sock_type, type = response
+
                             if id != None:
                                 connections[fileno]["id"] = id
                                 connections[fileno]["type"] = type
                                 connections[fileno]["sock_type"] = sock_type
+                                print(f"Registered {type}")
                                 if type == "worker":
                                     self.workers[id] = {
                                         "fileno": fileno,
@@ -199,9 +207,6 @@ class Coordinator:
                                         # Send pending results
                                         for result in self.clients[id]["finished_results"]:
                                             self.schedule_response(result, connections[fileno], fileno)
-
-                                    # TODO
-                                    # Send stats of running jobs?
                             else:
                                 print("Error registering socket")
                                 epoll.unregister(fileno)
@@ -237,6 +242,7 @@ class Coordinator:
                                     name = self.jobs[job_id]["name"]
                                     script = self.jobs[job_id]["script"]
 
+                                    print("Schedule job 1")
                                     self.schedule_job(client_id, script, name, job_id)
 
                             print(f"{connection["id"]} disconnected")
@@ -246,6 +252,7 @@ class Coordinator:
                             continue
         except Exception as e:
             print(f"[COORD] crashed:",e)
+            traceback.print_exc()
             exit(1)
 
     def read_buffer(self, connection):
@@ -266,7 +273,6 @@ class Coordinator:
                 
         # Need at least 4 bytes to know message length
         if len(buffer) < 4:            
-            # Rene: is this necessary? print('[DEBUG] coord handle_request: not enough for msg length')
             return None
 
         # Read length if available
@@ -274,7 +280,6 @@ class Coordinator:
 
         # Check if full message arrived:
         if len(buffer) < 4 + message_len:
-            # Rene: is this necessary? print('[DEBUG] coord handle_request: incomplete message received')
             return None
 
         # Read full message
@@ -295,14 +300,12 @@ class Coordinator:
         i = 0
         n = len(self.job_queue)
         while i < n:
-            print(self.job_queue)
-            print(self.job_queue)
             job_id = self.job_queue.popleft()
-            print(self.job_queue)
             print(f"Trying to schedule {job_id}")
             client_id = self.jobs[job_id]["client_id"]
             script = self.jobs[job_id]["script"]
             name = self.jobs[job_id]["name"]
+            print("Schedule job 2")
             self.schedule_job(client_id, script, name, job_id)
             i += 1
     
@@ -376,11 +379,11 @@ class Coordinator:
 
                     case "ack":
                         if fileno in self.recv_ack_worker:
-                            if self.invalid_args(["ack_type", "status", "job_id", "id"], request, connection, fileno):
+                            if self.invalid_args(["ack_type", "status", "job_id"], request, connection, fileno):
                                 return
 
                             job_id = request["job_id"]
-                            worker_id = connection["id"]
+                            worker_id = self.jobs[job_id]["worker_id"]
                             
                             if request["ack_type"] == "schedule":
                                 if request["status"] == "ok":
@@ -389,6 +392,7 @@ class Coordinator:
                                 else:
                                     job = self.jobs[job_id]
                                     job["worker_id"] = None
+                                    print("Schedule job 3")
                                     self.schedule_job(job["client_id"], job["script"], job["name"], job_id)
                             
                             if request["ack_type"] == "stop":
@@ -425,7 +429,7 @@ class Coordinator:
                         if self.invalid_args(["zip_bytes", "job_id"], request, connection, fileno):
                             return
 
-                        print(f"Recieved output from {request["id"]} for job {request["job_id"]}")
+                        print(f"Received output from {request["id"]} for job {request["job_id"]}")
 
                         print("Saving to disk...")
 
@@ -433,7 +437,7 @@ class Coordinator:
                         worker_id = connection["id"]
 
                         zip_path = os.path.join(self.jobs_dir, f"{job_id}_output.zip")
-                        encoded_zip = request["zip_file"]
+                        encoded_zip = request["zip_bytes"]
                         zip_bytes = base64.b64decode(encoded_zip)
 
                         try:
@@ -482,12 +486,16 @@ class Coordinator:
                         name = self.jobs[job_id]["name"]
 
                         username = self.jobs[job_id]["client_id"]
+                        print(self.clients)
+                        print("Username",username)
                         client_fd = self.clients[username]["fileno"]
 
                         request = {
-                            "method": "output",
+                            "tag": "output",
+                            "status": "success",
                             "zip_bytes": encoded_bytes,
                             "name": name,
+                            "job_id": job_id
                         }
                         print(f"about to schedule message to client to receive output from {name}")
                         self.schedule_response(request, self.connections[client_fd], client_fd)
@@ -553,6 +561,8 @@ class Coordinator:
 
                         print(f'[CLIENT_JOIN] client {id} joined')
 
+                        self.schedule_response(response, connection, fileno)
+
                         return id, None, type
 
                     case "ack":
@@ -591,6 +601,7 @@ class Coordinator:
                                     name = self.jobs[job_id]["name"]
 
                                     username = self.jobs[job_id]["client_id"]
+                                    print(self.clients[username])
                                     client_fd = self.clients[username]["fileno"]
 
                                     request = {
@@ -602,6 +613,9 @@ class Coordinator:
                                     self.schedule_response(request, self.connections[client_fd], client_fd)
                                     print("scheduled message with job")
                                     print("expecting client ack")
+                                
+                                else:
+                                    print("Received ack from client that received output")
 
                     case "stats":
 
@@ -624,7 +638,7 @@ class Coordinator:
 
                         jobs = []
                         # Send (job_id, status)
-                        for job_id in self.clients[username]["pending"]:
+                        for job_id in self.clients[username]["pending_results"]:
                             status = self.jobs[job_id]["status"]
                             name = self.jobs[job_id]["name"]
                             jobs.append([name, status])
@@ -639,10 +653,12 @@ class Coordinator:
                         return
 
                     case "submit":
-                        if self.invalid_args(["zip_file", "script", "name"], request, connection, fileno):
+                        if self.invalid_args(["zip_file", "script", "name", "username"], request, connection, fileno):
                             return
 
                         job_id = str(uuid.uuid4())
+
+                        username = request["username"]
 
                         zip_path = os.path.join(self.jobs_dir, f"{job_id}_input.zip")
 
@@ -661,15 +677,16 @@ class Coordinator:
                                 "status": "ok",
                                 "tag": "submit",
                                 "job_id": job_id,
+                                "name": name,
                                 "message":  f"Job request {name} received and started"
                             }
                             self.schedule_response(response, connection, fileno)
 
-                            self.clients["pending_results"].append(job_id)
+                            self.clients[username]["pending_results"].append(job_id)
 
                             # contact a worker
 
-                            self.schedule_job(fileno, script, name, job_id)
+                            self.schedule_job(username, script, name, job_id)
                         except Exception as e:
                             print(f"Failed to write zip file {zip_path}: {e}")
 
@@ -693,6 +710,7 @@ class Coordinator:
                     "tag": "type",
                     "mesasge": "Must specify if type is client or worker only"
                 }
+                self.schedule_response(response, connection, fileno)
 
 
     def schedule_job(self, client_id, script, name, job_id=None):
@@ -701,20 +719,22 @@ class Coordinator:
         if not job_id:
             job_id = str(uuid.uuid4())
 
-        zip_path = f"{job_id}_input.zip"
+        zip_path = os.path.join(self.jobs_dir, f"{job_id}_input.zip")
         
         worker_id = self.select_worker()
         print(f"Trying to schedule {job_id} in {worker_id}")
+
+        self.jobs[job_id] = {
+            "client_id": client_id,
+            "status": "not_started",
+            "script": script,
+            "name": name
+        }
+
         try:
             worker_fd = self.workers[worker_id]["fileno"]
                                     
-            self.jobs[job_id] = {
-                "client_id": client_id,
-                "worker_id": worker_id,     
-                "status": "not_started",
-                "script": script,
-                "name": name
-            }
+            self.jobs[job_id]["worker_id"] = worker_id
 
             try:
                 with open(zip_path, "rb") as f:
@@ -745,12 +765,6 @@ class Coordinator:
         except Exception as e:
             print(f"[COORD] Worker {worker_id} failed: [{e}], trying another worker")
 
-        response = {
-            "status": "error",
-            "message": f"job {job_id} failed to schedule"
-        }
-        self.schedule_response(response, self.connections[self.clients[client_id]["fileno"]], self.clients[client_id]["fileno"])
-
         print(f"[COORD] All workers failed or no workers active")
         self.job_queue.append(job_id)
 
@@ -758,8 +772,6 @@ class Coordinator:
         if not self.workers:
             print("No workers available to run a job")
             return None
-        
-        print(self.workers)
         
         eligible_ids = [
             wid for wid, stats in self.workers.items() 
@@ -807,7 +819,7 @@ class Coordinator:
         except (TypeError, ValueError):
             print(f"[COORD] Error: Couldn't serialize response to JSON")
     
-        connection["send_buffer"] += final_response
+        connection["send_queue"].append(final_response)
         self.epoll.modify(fileno, select.EPOLLIN | select.EPOLLOUT)
 
     def send_response(self, connection):
@@ -834,26 +846,6 @@ class Coordinator:
         except socket.error as e:
             print(f"[COORD] Network Error: Failed to send response: {e}")
             return False # network error, client disconnected
-
-    # -----------------------------------
-    # State Updating Functions
-    # - standardize adding/removing jobs, etc
-    # Rene: remove? check my own schedule logic
-    # -----------------------------------
-
-    def incoming_job(self, username, script, outputs, dir_zip):
-        job_id = str(uuid.uuid4())
-        self.jobs[job_id] = {
-            "client_id": username,
-            "worker_id": None,     # or None if not scheduled / rescheduled,
-            "status": "not_started",
-            "script": script,        # script to run program
-            "output_files": outputs,
-            "zip": dir_zip,
-            "result": None          # store stdout, stderr
-        }
-        
-        return job_id
 
     # ------------------------------------
     # Catalog Update
@@ -940,14 +932,14 @@ class Coordinator:
         elif event == "dispatched" and job_id:
             if job_id in self.jobs:
                 self.jobs[job_id]["status"] = "running"
-                self.jobs[job_id]["worker"] = entry.get("worker")
+                self.jobs[job_id]["worker_id"] = entry.get("worker")
         elif event == "finished" and job_id:
             if job_id in self.jobs:
                 self.jobs[job_id]["status"] = "finished"
         elif event == "requeued" and job_id:
             if job_id in self.jobs:
                 self.jobs[job_id]["status"] = "queued"
-                self.jobs[job_id]["worker"] = None
+                self.jobs[job_id]["worker_id"] = None
  
     def _write_txn(self, entry: dict) -> None:
         """

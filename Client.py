@@ -6,7 +6,7 @@ Usage:
 
 The coordinator is discovered automatically via the ND catalog service.
 Once connected, type commands at the prompt:
-    submit --job <dir> --exec <script> [--outputs <rel/path> ...] [--out-dir <local_dir>]
+    submit --job_dir <dir> --exec <script> --job_name <name> [--outputs <rel/path> ...] [--out-dir <local_dir>]
     stats
     quit
 
@@ -131,6 +131,7 @@ def connect_to_coordinator(username: str) -> socket.socket:
 
             join_msg = {
                     "method": "register",
+                    "type": "client",
                     "username": username
             }
             send_message(sock, json.dumps(join_msg).encode('utf-8'))
@@ -165,10 +166,11 @@ def zip_directory(dir_path: str) -> bytes:
 
 # Rene: I added out_dir because it wasn't defined, did you mean to pass in out_dir
 # as an arg?
-def extract_zip(zip_bytes: bytes, job_id: str, out_dir) -> None:
-    os.makedirs(f'./results_{job_id}', exist_ok=True)
+def extract_zip(zip_bytes: bytes, username: str, name: str) -> None:
+    os.makedirs(f'./{username}', exist_ok=True)
+    output_path = os.path.join(username, name)
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        zf.extractall(out_dir)
+        zf.extractall(output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -179,13 +181,15 @@ def extract_zip(zip_bytes: bytes, job_id: str, out_dir) -> None:
 def build_submit_message(username: str,
                          exec_script: str,
                          outputs: list[str],
-                         zip_bytes: bytes) -> bytes:
+                         zip_bytes: bytes,
+                         name: str) -> bytes:
     message_dict = {
-        "method": "SUBMIT_JOB",
+        "method": "submit",
         "username": username,
-        "exec_script": exec_script,
-        "outputs": outputs,
-        "zip_data": base64.b64encode(zip_bytes).decode('utf-8'),
+        "script": exec_script,
+        "name": name,
+        # "outputs": outputs,
+        "zip_file": base64.b64encode(zip_bytes).decode('utf-8'),
         "type": "client"
     }
 
@@ -211,6 +215,15 @@ def build_stop_message(username: str, job_id: int) -> bytes:
 
     return json.dumps(message_dict).encode('utf-8')
 
+def build_output_ack(job_id: str) -> bytes:
+    message_dict = {
+        "type": "client",
+        "method": "ack",
+        "ack_type": "output",
+        "status": "ok",
+        "job_id": job_id
+    }
+    return json.dumps(message_dict).encode('utf-8')
 
 # ---------------------------------------------------------------------------
 # Session
@@ -263,7 +276,7 @@ def _handle_push(session: Session, message: bytes) -> None:
     try:
         msg = json.loads(message.decode('utf-8'))
     except Exception as e:
-        print(f'[ERROR] Failed ot decode message: {message}\nError: {e}')
+        print(f'[ERROR] Failed to decode message: {message}\nError: {e}')
         return
 
     if "tag" not in msg or msg.get("tag") is None:
@@ -274,7 +287,7 @@ def _handle_push(session: Session, message: bytes) -> None:
 
     if tag == "error":
         message = msg.get("message", "no error provided")
-        print(f'[ERROR] {e}')
+        print(f'[ERROR] {message}')
     elif tag == "register":
         if ok:
             session.connected = True
@@ -285,8 +298,8 @@ def _handle_push(session: Session, message: bytes) -> None:
             if len(jobs) == 0:
                 print(f'[STATS] No jobs associated with user {session.username}')
             else:
-                for j in jobs:
-                    print(f'\n{j}') # TODO prettier printing after format has settled
+                for name, status in jobs:
+                    print(f'\n{name}: {status}') # TODO prettier printing after format has settled
     elif tag == "stop_ack":
         if ok:
             job_id = msg.get("job_id", "UNKNOWN")
@@ -298,16 +311,27 @@ def _handle_push(session: Session, message: bytes) -> None:
     elif tag == "submit":
         if ok:
             job_id = msg.get("job_id")
+            name = msg.get("name", "NA")
             if not job_id:
                 print(f'[ERROR] Internal Error: No job_id provided by coordinator')
             else:
-                print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./results_{job_id}')
+                print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./{session.username}/{name}')
         else:
             print(f'[ERROR] Failed to process job submission')
+    elif tag == "output":
+        name = msg.get("name", "NA")
+        print(f"Received output from job {name}")
+        handle_output(session, msg["job_id"])
+
+        encoded_zip = msg["zip_bytes"]
+        zip_bytes = base64.b64decode(encoded_zip)
+
+        extract_zip(zip_bytes, session.username, name)
+
     else:
         if not ok or tag == "error":
             message = msg.get("message", "no error provided")
-            print(f'[ERROR] {e}')
+            print(f'[ERROR] {message}')
         
 
     #print(f"\n((client._hand_push)) Message Received: {msg}")
@@ -345,24 +369,28 @@ def _handle_push(session: Session, message: bytes) -> None:
 # ---------------------------------------------------------------------------
 
 def handle_submit(session: Session, args: argparse.Namespace) -> None:
-    if not os.path.isdir(args.job):
-        print(f"[ERROR] Not a directory: {args.job}")
+    if not os.path.isdir(args.job_dir):
+        print(f"[ERROR] Not a directory: {args.job_dir}")
         return
 
     outputs = args.outputs or []
 
-    print(f"[INFO] Zipping {args.job} ...")
+    print(f"[INFO] Zipping {args.job_dir} ...")
     try:
-        zip_bytes = zip_directory(args.job)
+        zip_bytes = zip_directory(args.job_dir)
     except Exception as exc:
         print(f"[ERROR] Failed to zip directory: {exc}")
         return
+    
+    dir_name = os.path.basename(args.job_dir.rstrip("/")) 
+    exec_script = os.path.join(dir_name, args.exec)
 
     msg = build_submit_message(
         username    = session.username,
-        exec_script = args.exec,
+        exec_script = exec_script,
         outputs     = outputs,
         zip_bytes   = zip_bytes,
+        name        = args.job_name
     )
 
     try:
@@ -383,6 +411,11 @@ def handle_stop(session: Session, args: argparse.Namespace) -> None:
     except OSError as exc:
         print(f"[ERROR] {exc}")
 
+def handle_output(session: Session, job_id: str) -> None:
+    try:
+        send_message(session.sock, build_output_ack(job_id))
+    except OSError as exc:
+        print(f"[ERROR] {exc}")
 
 # ---------------------------------------------------------------------------
 # Interactive REPL parser
@@ -393,12 +426,15 @@ def make_repl_parser() -> argparse.ArgumentParser:
     sub    = parser.add_subparsers(dest="command")
 
     p_submit = sub.add_parser("submit", exit_on_error=False)
-    p_submit.add_argument("--job",     required=True,
+    p_submit.add_argument("--job_dir",     required=True,
                           help="Path to the job directory")
     p_submit.add_argument("--exec",    required=True,
                           help="Entry-point script relative to the job directory root")
+    p_submit.add_argument("--job_name",    required=True,
+                          help="Name to identify job"),
     p_submit.add_argument("--outputs", nargs="*", default=[],
                           help="Relative paths inside the job dir to retrieve on completion")
+    
 
     sub.add_parser("stats", exit_on_error=False)
 
@@ -415,7 +451,7 @@ def make_repl_parser() -> argparse.ArgumentParser:
 
 HELP_TEXT = """\
 Commands:
-  submit --job <dir> --exec <script> [--outputs <path> ...] [--out-dir <dir>]
+  submit --job_dir <dir> --exec <script> --job_name <name> [--outputs <path> ...] [--out-dir <dir>]
       Zip <dir> and submit it. --exec is the entry-point script inside the dir.
       --outputs lists relative paths to retrieve when done (e.g. results/ logs/out.txt).
       Results are extracted automatically when the coordinator pushes them back.

@@ -236,6 +236,7 @@ class Coordinator:
 
                                             print(f"Client {id} reconnected, sending output")
                                             self.schedule_response(result, connections[fileno], fileno)
+                                            self.recv_ack_client.add(id)
                                             print(f"Expecting ack from client {id}")
                             else:
                                 print("Error registering socket")
@@ -550,7 +551,7 @@ class Coordinator:
                             print(f"about to schedule message to client to receive output from {name}")
                             self.schedule_response(request, self.connections[client_fd], client_fd)
                             print("scheduled message with job")
-                            self.recv_ack_client.add(client_fd)
+                            self.recv_ack_client.add(username)
                             print("expecting client ack")
                             
                             self.jobs[job_id]["status"] = "finished" # don't change
@@ -629,7 +630,8 @@ class Coordinator:
 
                     case "ack": # client
 
-                        if fileno in self.recv_ack_client:
+                        client_id = connection["id"]
+                        if client_id in self.recv_ack_client:
                             if self.invalid_args(["ack_type", "status", "job_id"], request, connection, fileno):
                                     return
                             
@@ -674,6 +676,7 @@ class Coordinator:
                                     print(self.clients)
                                     self.clients[username]["finished_results"].remove(job_id)
                                     del self.jobs[job_id] # Maybe change
+                                    self.recv_ack_client.remove(client_id)
 
                     case "stats":
                         if self.invalid_args(["username"], request, connection, fileno):

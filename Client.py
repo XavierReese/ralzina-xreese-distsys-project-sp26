@@ -24,6 +24,7 @@ import zipfile
 import shlex
 import json
 import base64
+import queue
 
 import requests
 
@@ -242,6 +243,33 @@ class Session:
         self.sock                             = sock
         self.username                         = username
         self.connected                        = False
+        self.send_q                           = queue.Queue()
+
+    def push_msg(self, msg):
+        self.send_q.put(msg)
+
+# ---------------------------------------------------------------------------
+# Background sender thread
+# - continuously pops and send messages from queue
+# ---------------------------------------------------------------------------
+
+def sender_loop(session: Session) -> None:
+    """
+    Runs on its own thread. Pops messages from thread-safe queue and sends them.
+    Avoids conflicts between receiver thread sending acks, and messages based on client input
+    """
+    while True:
+        msg = session.send_q.get()
+
+        if msg is None: break
+
+        try:
+            print(f'SENDING MSG: {msg}')
+            send_message(session.sock, msg)
+        except OSError as exc:
+            print(f"[ERROR] Failed to send message: {exc}")
+            return
+
 
 # ---------------------------------------------------------------------------
 # Background receiver thread
@@ -350,29 +378,17 @@ def handle_submit(session: Session, args: argparse.Namespace) -> None:
         name        = args.job_name
     )
 
-    try:
-        send_message(session.sock, msg)
-    except OSError as exc:
-        print(f"[ERROR] Failed to send job: {exc}")
-        return
+    session.push_msg(msg)
+
 
 def handle_stats(session: Session) -> None:
-    try:
-        send_message(session.sock, build_stats_message(session.username))
-    except OSError as exc:
-        print(f"[ERROR] {exc}")
+    session.push_msg(build_stats_message(session.username))
 
 def handle_stop(session: Session, args: argparse.Namespace) -> None:
-    try:
-        send_message(session.sock, build_stop_message(args.job_id))
-    except OSError as exc:
-        print(f"[ERROR] {exc}")
+    session.push_msg(build_stop_message(args.job_id))
 
 def handle_output(session: Session, job_id: str) -> None:
-    try:
-        send_message(session.sock, build_output_ack(job_id))
-    except OSError as exc:
-        print(f"[ERROR] {exc}")
+    session.push_msg(build_output_ack(job_id))
 
 # ---------------------------------------------------------------------------
 # Interactive REPL parser
@@ -444,6 +460,11 @@ def run_session(username: str) -> None:
         target=receiver_loop, args=(session,), daemon=True, name="receiver"
     )
     recv_thread.start()
+
+    send_thread = threading.Thread(
+        target=sender_loop, args=(session,), daemon=True, name="sender"
+    )
+    send_thread.start()
 
     repl_parser = make_repl_parser()
     print(HELP_TEXT)

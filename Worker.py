@@ -94,10 +94,21 @@ class Worker:
 
         self.running_jobs = {}
 
-        if os.path.exists(self.worker_dir):
-            print(f"Detected existing workspace. Cleaning up old data...")
-            # rm -rf
-            shutil.rmtree(self.worker_dir)
+        # rm -rf
+        i = 0
+        while i < 5:
+            try:
+                if os.path.exists(self.worker_dir):
+                    print(f"Detected existing workspace. Cleaning up old data...")
+                    shutil.rmtree(self.worker_dir)
+                break 
+            except OSError as e:
+                # Errno 39 is 'Directory not empty'
+                time.sleep(0.5)
+                continue
+        
+        if i == 5:
+            print(f"Failed to delete {self.worker_dir}")
 
         # Create worker directory
         os.makedirs(self.worker_dir, exist_ok=True)
@@ -218,6 +229,7 @@ class Worker:
             "method": "register",
             "type": "worker",
             "id": self.worker_name,
+            "max_jobs": self.max_jobs
         }
 
         pre_response = json.dumps(response).encode("utf-8")
@@ -342,13 +354,25 @@ class Worker:
             request = json.loads(message_bytes.decode("utf-8"))
         except (TypeError, ValueError):
             response = {
-                "status": "invalid",
+                "status": "error",
                 "value": "Request is not valid JSON"
             }
             with self.req_lock:
                 self.send_message(response, self.req_sock, "req_sock")
 
         # validate fields
+
+        # Check if it's an error message
+        if "status" in request and request["status"] == "error":
+            if "message" not in request:
+                response = {
+                    "status": "error",
+                    "value": "Error message didn't include a message"
+                }
+                with self.req_lock:
+                    self.send_message(response, self.req_sock, "req_sock")
+            
+            print(f"[ERROR] Received error from Coordinator: {request["message"]}")
         
         if "method" not in request:
             print(request)
@@ -368,6 +392,13 @@ class Worker:
                 if self.invalid_args(["zip_bytes", "job_id", "script"], request):
                     return
                 
+                if len(self.running_jobs) > self.max_jobs:
+                    response = {
+                        "method": "ack",
+                        "ack_type": "schedule",
+                        "status": "error"
+                    }
+
                 zip_data = base64.b64decode(request["zip_bytes"])
                 task_dir = f"{self.worker_dir}/{request["job_id"]}"
                 zip_path = f"{task_dir}/{request["job_id"]}.zip" # working environment zip file
@@ -484,7 +515,7 @@ class Worker:
         for arg in args:
             if arg not in request:
                 response = {
-                    "status": "invalid",
+                    "status": "error",
                     "message": f"invalid, {arg} not present"
                 }
                 with self.req_lock:
@@ -683,15 +714,15 @@ worker sends result to coordinator when done
 
 def main():
     parser = argparse.ArgumentParser(description="Distributed job worker")
-    parser.add_argument("--worker", required=True, type=str, help="Worker name")
+    parser.add_argument("--name", required=True, type=str, help="Worker name")
     parser.add_argument("--max_jobs", type=int, default=MAX_JOBS, help=f"Max jobs worker can hold (default: {MAX_JOBS})")
     args = parser.parse_args()
 
-    Worker(args.worker,args.max_jobs)
+    Worker(args.name,args.max_jobs)
 
 if __name__ == "__main__":
     main()
 
 """
-Fix "status": "error" messages
+Fix error" messages
 """

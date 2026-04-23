@@ -18,7 +18,6 @@ import argparse
 import io
 import os
 import socket
-import sys
 import threading
 import time
 import zipfile
@@ -285,90 +284,45 @@ def _handle_push(session: Session, message: bytes) -> None:
     tag = msg.get("tag")
     ok = msg.get("status", "error") == "ok"
 
-    if tag == "error":
+    if not ok:
         message = msg.get("message", "no error provided")
         print(f'[ERROR] {message}')
     elif tag == "register":
-        if ok:
-            session.connected = True
-            print(f'[JOIN] Successful')
+        session.connected = True
+        print(f'[JOIN] Successful')
     elif tag == "stats":
-        if ok:
-            jobs = msg.get("message", [])
-            if len(jobs) == 0:
-                print(f'[STATS] No jobs associated with user {session.username}')
-            else:
-                for name, status, job_id in jobs:
-                    print(f'\n{name}: {status} with job_id {job_id}') # TODO prettier printing after format has settled
+        jobs = msg.get("message", [])
+        if len(jobs) == 0:
+            print(f'[STATS] No jobs associated with user {session.username}')
+        else:
+            for name, status, job_id in jobs:
+                print(f'\n{name}: {status} with job_id {job_id}', end="")
+            print()
     elif tag == "stop_ack":
-        if ok:
-            job_id = msg.get("job_id", "UNKNOWN")
-            print(f'[STOP] request to stop job {job_id} received and acknowledged')
+        job_id = msg.get("job_id", "UNKNOWN")
+        print(f'[STOP] request to stop job {job_id} received and acknowledged')
     elif tag == "stop":
-        if ok:
-            job_id = msg.get("job_id", "UNKNOWN")
-            print(f'[STOP] job {job_id} stopped')
+        job_id = msg.get("job_id", "UNKNOWN")
+        print(f'[STOP] job {job_id} stopped')
     elif tag == "submit":
-        if ok:
-            job_id = msg.get("job_id")
-            name = msg.get("name", "NA")
-            if not job_id:
-                print(f'[ERROR] Internal Error: No job_id provided by coordinator')
-            else:
-                print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./{session.username}/{name}')
+        job_id = msg.get("job_id")
+        name = msg.get("name", "NA")
+        if not job_id:
+            print(f'[ERROR] Internal Error: No job_id provided by coordinator')
         else:
-            print(f'[ERROR] Failed to process job submission')
+            print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./{session.username}/{name}')
     elif tag == "output":
-        if ok:
-            name = msg.get("name", "NA")
-            print(f"Received output from job {name}")
-            job_id = msg["job_id"]
-            handle_output(session, job_id)
+        name = msg.get("name", "NA")
+        job_id = msg["job_id"]
+        print(f"[OUTPUT] Received output from job {name}--{job_id}")
+        handle_output(session, job_id)
 
-            encoded_zip = msg["zip_bytes"]
-            zip_bytes = base64.b64decode(encoded_zip)
+        encoded_zip = msg["zip_bytes"]
+        zip_bytes = base64.b64decode(encoded_zip)
 
-            extract_zip(zip_bytes, session.username, name, job_id)
-        else:
-            name = msg.get("name", "NA")
-            print(f"Output for job {name} failed.")
-
+        extract_zip(zip_bytes, session.username, name, job_id)
     else:
-        if not ok or tag == "error":
-            message = msg.get("message", "no error provided")
-            print(f'[ERROR] {message}')
-
-        
-
-    #print(f"\n((client._hand_push)) Message Received: {msg}")
-
-    '''
-    if tag == "RESULT":
-        # Format: RESULT <job_id>\n<zip bytes>
-        job_id  = parts[1] if len(parts) > 1 else "unknown"
-        out_dir = session.pop_out_dir(job_id) or f"./job_{job_id}_results"
-
-        print(f"\n[RESULT] Job {job_id} complete. Extracting to {out_dir} ...")
-        try:
-            extract_zip(payload, out_dir)
-            print(f"[RESULT] Done — files in {out_dir}")
-        except Exception as exc:
-            print(f"[ERROR] Failed to extract results for job {job_id}: {exc}")
-
-    elif tag == "OK":
-        # TODO: call session.register_job(job_id, pending_out_dir) if this is a SUBMIT_JOB ack
-        print(f"\n[OK] {' '.join(parts[1:])}")
-
-    elif tag == "STATUS":
-        print(f"\n[STATUS] {' '.join(parts[1:])}")
-
-    elif tag == "ERROR":
-        print(f"\n[ERROR] {' '.join(parts[1:])}")
-
-    else:
-        print(f"\n[COORDINATOR] {header_bytes.decode(errors='replace')}")
-    '''
-
+        print(f'[ERROR] No tag provided')
 
 # ---------------------------------------------------------------------------
 # REPL command handlers
@@ -434,9 +388,7 @@ def make_repl_parser() -> argparse.ArgumentParser:
     p_submit.add_argument("--exec",    required=True,
                           help="Entry-point script relative to the job directory root")
     p_submit.add_argument("--job_name",    required=True,
-                          help="Name to identify job"),
-    #p_submit.add_argument("--outputs", nargs="*", default=[],
-                          #help="Relative paths inside the job dir to retrieve on completion")
+                          help="Name to identify job")
     
 
     sub.add_parser("stats", exit_on_error=False)
@@ -448,6 +400,8 @@ def make_repl_parser() -> argparse.ArgumentParser:
     sub.add_parser("quit",  exit_on_error=False)
 
     sub.add_parser("help",  exit_on_error=False)
+
+    sub.add_parser("clear", exit_on_error=False)
 
     return parser
 
@@ -467,6 +421,9 @@ Commands:
       
   stats
       Query job stats from the coordinator.
+
+  clear
+      Clear terminal
 
   quit
       Disconnect and exit.
@@ -517,6 +474,8 @@ def run_session(username: str) -> None:
             handle_stats(session)
         elif args.command == "stop":
             handle_stop(session, args)
+        elif args.command == "clear":
+            os.system("clear")
 
     sock.close()
 

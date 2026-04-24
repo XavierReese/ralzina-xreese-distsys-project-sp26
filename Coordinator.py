@@ -548,7 +548,7 @@ class Coordinator:
                         }
 
                         if client_fd in self.connections:
-                            print(f"[{self.connections[client_fd]}] Scheduling job output {name}")
+                            print(f"[{self.connections[client_fd]["id"]}] Scheduling job output {name}")
                             self.schedule_response(request, self.connections[client_fd], client_fd)
                             # print("scheduled message with job")
                             self.recv_ack_client.add(username)
@@ -665,7 +665,7 @@ class Coordinator:
                                         "zip_bytes": encoded_bytes,
                                         "name": name,
                                     }
-                                    print(f"[{self.connections[client_fd]}] Sending result of job {name}")
+                                    print(f"[{self.connections[client_fd]["id"]}] Sending result of job {name}")
                                     self.schedule_response(request, self.connections[client_fd], client_fd)
                                     # print("scheduled message with job")
                                     # print("expecting client ack")
@@ -805,7 +805,7 @@ class Coordinator:
 
             self.workers[worker_id]["running_jobs"].add(job_id)
 
-            print(f"[{worker_id}] scheduling job with worker")
+            print(f"[{worker_id}] Scheduling job with worker")
             self.schedule_response(request, self.connections[worker_fd], worker_fd)
             # print("scheduled message with job")
             self.recv_ack_worker.add(worker_fd)

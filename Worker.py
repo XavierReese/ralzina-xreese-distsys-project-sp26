@@ -99,7 +99,7 @@ class Worker:
         while i < 5:
             try:
                 if os.path.exists(self.worker_dir):
-                    print(f"Detected existing workspace. Cleaning up old data...")
+                    print(f"[WORKER] Detected existing workspace. Cleaning up old data...")
                     shutil.rmtree(self.worker_dir)
                 break 
             except OSError as e:
@@ -108,7 +108,7 @@ class Worker:
                 continue
         
         if i == 5:
-            print(f"Failed to delete {self.worker_dir}")
+            print(f"[ERROR] Failed to delete {self.worker_dir}")
 
         # Create worker directory
         os.makedirs(self.worker_dir, exist_ok=True)
@@ -125,12 +125,12 @@ class Worker:
         # Start update thread
         update_thread = threading.Thread(target=self.update, daemon=True)
         update_thread.start()
-        print("Worker update thread started")
+        print("[WORKER] Update thread started")
 
         # Start message sender thread
         res_thread = threading.Thread(target=self.res_thread, daemon=True)
         res_thread.start()
-        print("Worker response thread started")
+        print("[WORKER] Response thread started")
 
     def start_sock(self, sock_type):
         sock = self.connect_to_coordinator()
@@ -147,7 +147,7 @@ class Worker:
             sock = self.connect_to_coordinator()
 
     def connect_to_coordinator(self):
-        print("Attempting to connect to coordinator")
+        print("[CONNECT] Attempting to connect to coordinator")
 
         # Connect to coordinator
         # After connecting, sock is the socket to talk to the coordinator
@@ -157,10 +157,10 @@ class Worker:
             if sock is not None:
                 return sock
             if backoff >= MAX_BACKOFF:
-                print(f"Max backoff reached: {MAX_BACKOFF}. Quitting...")
+                print(f"[ERROR] Max backoff reached: {MAX_BACKOFF}. Quitting...")
                 sys.exit(1)
 
-            print(f"Retrying in {backoff}s")
+            print(f"[CONNECT] Retrying in {backoff}s")
             time.sleep(backoff)
             backoff *= 2
 
@@ -180,11 +180,11 @@ class Worker:
             response = conn.getresponse()
             
         except Exception:
-            print(f"Worker for {COORDINATOR_TYPE} Could not contact catalog")
+            print(f"[ERROR] Worker for {COORDINATOR_TYPE} Could not contact catalog")
             return None
         
         if response.status != 200:
-            print(f"[Worker for {COORDINATOR_TYPE} Could not contact catalog: HTTP error {response.status}")
+            print(f"[ERROR] Worker for {COORDINATOR_TYPE} Could not contact catalog: HTTP error {response.status}")
             return None
         
         data = response.read()
@@ -202,7 +202,7 @@ class Worker:
         if matching_services:
             latest_service = max(matching_services, key=lambda x: x[2])
         else:
-            print("Worker contacted name server but found no coordinator")
+            print("[ERROR] Worker contacted name server but found no coordinator")
             return None
 
         # Section 2
@@ -220,7 +220,7 @@ class Worker:
             return new_sock
             
         except Exception as e:
-            print(f"Worker for {COORDINATOR_TYPE} socket creation failed: {e}")
+            print(f"[ERROR] Worker for {COORDINATOR_TYPE} socket creation failed: {e}")
             return None
 
     def register(self, sock, sock_type):
@@ -241,7 +241,7 @@ class Worker:
             sock.sendall(final_response)
             return True
         except (socket.error, BrokenPipeError) as e:
-            print(f"{sock_type} Network Error: {e}")
+            print(f"[{sock_type}] Network Error: {e}")
                     
             return False
             
@@ -313,7 +313,7 @@ class Worker:
 
             try:
                 if not data:
-                    print("Coordinator broke connection. Resetting...")
+                    print("[ERROR] Coordinator broke connection. Resetting...")
                     raise NetworkError("Network failed during send.")
 
                 # Need at least 4 bytes to know message length
@@ -334,9 +334,7 @@ class Worker:
                 data = data[4 + message_len:]
 
                 # Execute request
-                print("Executing")
                 self.execute(message_bytes)
-                print("Done executing")
             except NetworkError:
                 self.reset_signal.set()
 
@@ -416,7 +414,7 @@ class Worker:
                     ]
 
                     if not extracted_items:
-                        print("No directory found after unzipping file")
+                        print("[ERROR] No directory found after unzipping file")
                         response = {
                             "status": "error",
                             "message": "Invalid zip"
@@ -452,7 +450,7 @@ class Worker:
                         "status": "ok",
                         "job_id": request["job_id"]
                     }
-                    print("sending ack to coordinator")
+                    print("[ACK] Sending ack to coordinator")
                 except Exception as e:
                     response = {
                         "status": "error",
@@ -472,7 +470,7 @@ class Worker:
                             
                         process.terminate()
 
-                        print(f"Terminated job {job_id} from coordinator request")
+                        print(f"[INFO] Terminated job {job_id} from coordinator request")
 
                         del self.running_jobs[job_id]
                     
@@ -505,7 +503,7 @@ class Worker:
                 }
             
         with self.req_lock:
-            print("sending message to coord")
+            print("[NETWORK] sending message to coord")
             self.send_message(response, self.req_sock, "req_sock")
         
     def invalid_args(self, args, request):
@@ -548,17 +546,17 @@ class Worker:
                 response = json.loads(resp_bytes.decode("utf-8"))
                     
                 if response["status"] == "error":
-                    print(f"{sock_type}: ack failed")
+                    print(f"[{sock_type}] ack failed")
                     return False
                 else:
-                    print(f"{sock_type}: ack to {COORDINATOR_TYPE} succeeded")
+                    print(f"[{sock_type}] ack to {COORDINATOR_TYPE} succeeded")
                     return True
             except json.JSONDecodeError:
-                print(f"{sock_type}: Could not read ack from coordinator")
+                print(f"[{sock_type}] Could not read ack from coordinator")
                 return False
 
         except Exception as e:
-            print(f"{sock_type}: Worker error when receiving ack: {e}")
+            print(f"[{sock_type}] Worker error when receiving ack: {e}")
 
         return False
     
@@ -571,11 +569,11 @@ class Worker:
                 self.reset_signal.set()
                 continue
 
-            print("Sent update")
+            print("[UPDATE] Sent update")
 
             time.sleep(UPDATE_INTERVAL)
         
-        print("Network error, update thread stopped")
+        print("[ERROR] Network error, update thread stopped")
 
     def send_message(self, message, sock, sock_type):
         # send response
@@ -587,12 +585,12 @@ class Worker:
         while True:
             try:
                 sock.sendall(final_response)
-                print(f"sent {final_response}")
+                # print(f"[NETWORK] sent {final_response}")
                 break
             except (socket.error, BrokenPipeError) as e:
-                print(f"Worker Network Error: {e}")
+                print(f"[ERROR] Worker Network Error: {e}")
                 
-                raise NetworkError("Network failed during send.")
+                raise NetworkError("[RESET] Network failed during send.")
         
     def res_thread(self):
         """
@@ -619,11 +617,10 @@ class Worker:
                     stdout_bytes, stderr_bytes = job_proc.communicate()
     
                     # Convert bytes to string (handling potential empty results)
-                    stdout_text = stdout_bytes.decode('utf-8') if stdout_bytes else ""
-                    stderr_text = stderr_bytes.decode('utf-8') if stderr_bytes else ""
+                    # stdout_text = stdout_bytes.decode('utf-8') if stdout_bytes else ""
+                    # stderr_text = stderr_bytes.decode('utf-8') if stderr_bytes else ""
 
-                    print(f"Process finished with code {exit_code}, stdout {stdout_text} and stderr {stderr_text}")
-                    print("process finished, sending output")
+                    print("[OUTPUT] Process finished, sending output")
 
                     task_dir = f"{self.worker_dir}/{job_id}"
 
@@ -633,7 +630,7 @@ class Worker:
                     ]
 
                     if not extracted_items:
-                        print("No directory found to send output")
+                        print("[ERROR] No directory found to send output")
                         response = {
                             "status": "error",
                             "message": "Invalid zip"
@@ -671,7 +668,7 @@ class Worker:
                     with self.jobs_lock:
                         del self.running_jobs[job_id]
         
-        print("Network error, res_thread stopped")
+        print("[RESET] Network error, res_thread stopped")
 
     
 

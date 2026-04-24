@@ -840,7 +840,7 @@ class Coordinator:
                 self.available_jobs(worker_id),     # Priority 1: Highest available slots
                 -stats["cpu_load"],                 # Priority 2: Lowest CPU % (tie-breaker)
                 stats["free_main_mem_mb"],          # Priority 3: Highest RAM (tie-breaker)
-                stats["free_disk_mem_gb"]           # Priority 4: Highest Disk (tie-breaker)
+                stats["free_disk_mem_gb"]          # Priority 4: Highest Disk (tie-breaker)
             )
         
         return max(eligible_ids, key=worker_score)

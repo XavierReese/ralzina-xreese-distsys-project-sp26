@@ -341,13 +341,16 @@ def _handle_push(session: Session, message: bytes) -> None:
     elif tag == "output":
         name = msg.get("name", "NA")
         job_id = msg["job_id"]
-        print(f"[OUTPUT] Received output from job {name}--{job_id}")
-        handle_output(session, job_id)
+
+        print(time.time())
 
         encoded_zip = msg["zip_bytes"]
         zip_bytes = base64.b64decode(encoded_zip)
 
         extract_zip(zip_bytes, session.username, name, job_id)
+
+        print(f"[OUTPUT] Received output from job {name}--{job_id}")
+        handle_output(session, job_id)
     else:
         print(f'[ERROR] No tag provided')
 
@@ -377,6 +380,7 @@ def handle_submit(session: Session, args: argparse.Namespace) -> None:
         name        = args.job_name
     )
 
+    print(time.time())
     session.push_msg(msg)
 
 

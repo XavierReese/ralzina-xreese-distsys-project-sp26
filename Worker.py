@@ -260,7 +260,6 @@ class Worker:
             "cpu_load": self.cpu_load(),
             "free_main_mem_mb": self.free_main_mem_mb(),
             "free_disk_mem_gb": self.free_disk_mem_gb(),
-            "available_jobs": self.max_jobs - len(self.running_jobs)
         }
 
         return stats
@@ -375,8 +374,6 @@ class Worker:
             print(f"[ERROR] Received error from Coordinator: {request["message"]}")
         
         if "method" not in request:
-            print(request)
-            sys.exit()
             response = {
                 "status": "error",
                 "message": "Missing method"

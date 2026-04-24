@@ -395,7 +395,7 @@ class Coordinator:
             
             print(f"[ERROR] Received error from {connection["type"]} {connection["id"]}: {request["message"]}")
 
-        # validate fields
+        # validate fields TODO could lowk skip this, connection already has "type" in it
         if "type" not in request:
             response = {
                 "status": "error",

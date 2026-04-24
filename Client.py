@@ -264,7 +264,6 @@ def sender_loop(session: Session) -> None:
         if msg is None: break
 
         try:
-            print(f'SENDING MSG: {msg}')
             send_message(session.sock, msg)
         except OSError as exc:
             print(f"[ERROR] Failed to send message: {exc}")

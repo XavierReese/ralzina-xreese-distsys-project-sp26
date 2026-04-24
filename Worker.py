@@ -617,8 +617,8 @@ class Worker:
                     stdout_bytes, stderr_bytes = job_proc.communicate()
     
                     # Convert bytes to string (handling potential empty results)
-                    # stdout_text = stdout_bytes.decode('utf-8') if stdout_bytes else ""
-                    # stderr_text = stderr_bytes.decode('utf-8') if stderr_bytes else ""
+                    stdout_text = stdout_bytes.decode('utf-8', errors='replace') if isinstance(stdout_bytes, bytes) else (stdout_bytes or "")
+                    stderr_text = stderr_bytes.decode('utf-8', errors='replace') if isinstance(stderr_bytes, bytes) else (stderr_bytes or "")
 
                     print("[OUTPUT] Process finished, sending output")
 

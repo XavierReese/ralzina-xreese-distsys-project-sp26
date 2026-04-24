@@ -15,7 +15,7 @@ n refers to how many workers you want
 Step 4:<br>
 ```bash cleanup_n_clients_n_workers n n```<br>
 The first n is how many clients where running when you called n_clients.sh<br>
-The second n is how many workers where running when you called n_clients.sh
+The second n is how many workers where running when you called n_workers.sh
 
 Step 5:<br>
 Repeat with any combination of n's you want

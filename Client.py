@@ -6,7 +6,7 @@ Usage:
 
 The coordinator is discovered automatically via the ND catalog service.
 Once connected, type commands at the prompt:
-    submit --job <dir> --exec <script> [--outputs <rel/path> ...] [--out-dir <local_dir>]
+    submit --job_dir <dir> --exec <script> --job_name <name> [--outputs <rel/path> ...] [--out-dir <local_dir>]
     stats
     quit
 
@@ -18,13 +18,13 @@ import argparse
 import io
 import os
 import socket
-import sys
 import threading
 import time
 import zipfile
 import shlex
 import json
 import base64
+import queue
 
 import requests
 
@@ -115,12 +115,12 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 # Connection helper
 # - calls discover_coordinator
 # - open TCP
-# - send JOIN
+# - send register request
 # ---------------------------------------------------------------------------
 
 def connect_to_coordinator(username: str) -> socket.socket:
     """
-    Discover the coordinator, open a TCP connection, and send JOIN <username>.
+    Discover the coordinator, open a TCP connection, and send register request
     Retries indefinitely on failure (re-discovering via catalog each time).
     """
     while True:
@@ -130,14 +130,15 @@ def connect_to_coordinator(username: str) -> socket.socket:
             sock.connect((host, port))
 
             join_msg = {
-                    "method": "JOIN_CLIENT",
+                    "method": "register",
+                    "type": "client",
                     "username": username
             }
             send_message(sock, json.dumps(join_msg).encode('utf-8'))
-            print(f"[JOIN] Requested to join coordinator as '{username}'")
+            print(f"[REGISTER] Requested to join coordinator as '{username}'")
             return sock
         except OSError as exc:
-            print(f"[JOIN] Connection failed ({exc}), rediscovering ...")
+            print(f"[REGISTER] Connection failed ({exc}), rediscovering ...")
             time.sleep(2)
 
 
@@ -163,11 +164,13 @@ def zip_directory(dir_path: str) -> bytes:
 
     return buf.getvalue()
 
-
-def extract_zip(zip_bytes: bytes, job_id: str) -> None:
-    os.makedirs(f'./results_{job_id}', exist_ok=True)
+# Rene: I added out_dir because it wasn't defined, did you mean to pass in out_dir
+# as an arg?
+def extract_zip(zip_bytes: bytes, username: str, name: str, job_id: str) -> None:
+    os.makedirs(f'./{username}', exist_ok=True)
+    output_path = os.path.join(username, f"{name}--{job_id}")
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        zf.extractall(out_dir)
+        zf.extractall(output_path)
 
 
 # ---------------------------------------------------------------------------
@@ -177,14 +180,17 @@ def extract_zip(zip_bytes: bytes, job_id: str) -> None:
 
 def build_submit_message(username: str,
                          exec_script: str,
-                         outputs: list[str],
-                         zip_bytes: bytes) -> bytes:
+                         # outputs: list[str],
+                         zip_bytes: bytes,
+                         name: str) -> bytes:
     message_dict = {
-        "method": "SUBMIT_JOB",
+        "method": "submit",
         "username": username,
-        "exec_script": exec_script,
-        "outputs": outputs,
-        "zip_data": base64.b64encode(zip_bytes).decode('utf-8')
+        "script": exec_script,
+        "name": name,
+        # "outputs": outputs,
+        "zip_file": base64.b64encode(zip_bytes).decode('utf-8'),
+        "type": "client"
     }
 
     return json.dumps(message_dict).encode('utf-8')
@@ -193,12 +199,31 @@ def build_submit_message(username: str,
 
 def build_stats_message(username: str) -> bytes:
     message_dict = {
-        "method": "JOB_STATS",
+        "method": "stats",
         "username": username,
+        "type": "client"
     }
 
     return json.dumps(message_dict).encode('utf-8')
 
+def build_stop_message(job_id: int) -> bytes:
+    message_dict = {
+            "method": "stop",
+            "type": "client",
+            "job_id": job_id
+    }
+
+    return json.dumps(message_dict).encode('utf-8')
+
+def build_output_ack(job_id: str) -> bytes:
+    message_dict = {
+        "type": "client",
+        "method": "ack",
+        "ack_type": "output",
+        "status": "ok",
+        "job_id": job_id
+    }
+    return json.dumps(message_dict).encode('utf-8')
 
 # ---------------------------------------------------------------------------
 # Session
@@ -218,6 +243,32 @@ class Session:
         self.sock                             = sock
         self.username                         = username
         self.connected                        = False
+        self.send_q                           = queue.Queue()
+
+    def push_msg(self, msg):
+        self.send_q.put(msg)
+
+# ---------------------------------------------------------------------------
+# Background sender thread
+# - continuously pops and send messages from queue
+# ---------------------------------------------------------------------------
+
+def sender_loop(session: Session) -> None:
+    """
+    Runs on its own thread. Pops messages from thread-safe queue and sends them.
+    Avoids conflicts between receiver thread sending acks, and messages based on client input
+    """
+    while True:
+        msg = session.send_q.get()
+
+        if msg is None: break
+
+        try:
+            send_message(session.sock, msg)
+        except OSError as exc:
+            print(f"[ERROR] Failed to send message: {exc}")
+            return
+
 
 # ---------------------------------------------------------------------------
 # Background receiver thread
@@ -251,103 +302,96 @@ def _handle_push(session: Session, message: bytes) -> None:
     try:
         msg = json.loads(message.decode('utf-8'))
     except Exception as e:
-        print(f'[ERROR] Failed ot decode message: {message}\nError: {e}')
+        print(f'[ERROR] Failed to decode message: {message}\nError: {e}')
         return
 
     if "tag" not in msg or msg.get("tag") is None:
         print(f'[ERROR] Invalid message received from coordinator - no tag: {msg}')
 
     tag = msg.get("tag")
+    ok = msg.get("status", "error") == "ok"
 
-    if tag == "ERROR":
+    if not ok:
         message = msg.get("message", "no error provided")
-        print(f'[ERROR] {e}')
-    elif tag == "ACK_JOIN":
+        print(f'[ERROR] {message}')
+    elif tag == "register":
         session.connected = True
         print(f'[JOIN] Successful')
-    elif tag == "JOB_STATS":
+    elif tag == "stats":
         jobs = msg.get("message", [])
         if len(jobs) == 0:
             print(f'[STATS] No jobs associated with user {session.username}')
         else:
-            for j in jobs:
-                print(f'\n{j}') # TODO prettier printing after format has settled
-
-    elif tag == "ACK_SUBMIT":
-        job_id = msg.get("message")
+            for name, status, job_id in jobs:
+                print(f'\n{name}: {status} with job_id {job_id}', end="")
+            print()
+    elif tag == "stop_ack":
+        job_id = msg.get("job_id", "UNKNOWN")
+        print(f'[STOP] request to stop job {job_id} received and acknowledged')
+    elif tag == "stop":
+        job_id = msg.get("job_id", "UNKNOWN")
+        print(f'[STOP] job {job_id} stopped')
+    elif tag == "submit":
+        job_id = msg.get("job_id")
+        name = msg.get("name", "NA")
         if not job_id:
             print(f'[ERROR] Internal Error: No job_id provided by coordinator')
         else:
-            print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./results_{job_id}')
-        
+            print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./{session.username}/{name}')
+    elif tag == "output":
+        name = msg.get("name", "NA")
+        job_id = msg["job_id"]
 
-    #print(f"\n((client._hand_push)) Message Received: {msg}")
+        print(time.time())
 
-    '''
-    if tag == "RESULT":
-        # Format: RESULT <job_id>\n<zip bytes>
-        job_id  = parts[1] if len(parts) > 1 else "unknown"
-        out_dir = session.pop_out_dir(job_id) or f"./job_{job_id}_results"
+        encoded_zip = msg["zip_bytes"]
+        zip_bytes = base64.b64decode(encoded_zip)
 
-        print(f"\n[RESULT] Job {job_id} complete. Extracting to {out_dir} ...")
-        try:
-            extract_zip(payload, out_dir)
-            print(f"[RESULT] Done — files in {out_dir}")
-        except Exception as exc:
-            print(f"[ERROR] Failed to extract results for job {job_id}: {exc}")
+        extract_zip(zip_bytes, session.username, name, job_id)
 
-    elif tag == "OK":
-        # TODO: call session.register_job(job_id, pending_out_dir) if this is a SUBMIT_JOB ack
-        print(f"\n[OK] {' '.join(parts[1:])}")
-
-    elif tag == "STATUS":
-        print(f"\n[STATUS] {' '.join(parts[1:])}")
-
-    elif tag == "ERROR":
-        print(f"\n[ERROR] {' '.join(parts[1:])}")
-
+        print(f"[OUTPUT] Received output from job {name}--{job_id}")
+        handle_output(session, job_id)
     else:
-        print(f"\n[COORDINATOR] {header_bytes.decode(errors='replace')}")
-    '''
-
+        print(f'[ERROR] No tag provided')
 
 # ---------------------------------------------------------------------------
 # REPL command handlers
 # ---------------------------------------------------------------------------
 
 def handle_submit(session: Session, args: argparse.Namespace) -> None:
-    if not os.path.isdir(args.job):
-        print(f"[ERROR] Not a directory: {args.job}")
+    if not os.path.isdir(args.job_dir):
+        print(f"[ERROR] Not a directory: {args.job_dir}")
         return
 
-    outputs = args.outputs or []
+    # outputs = args.outputs or []
 
-    print(f"[INFO] Zipping {args.job} ...")
+    print(f"[INFO] Zipping {args.job_dir} ...")
     try:
-        zip_bytes = zip_directory(args.job)
+        zip_bytes = zip_directory(args.job_dir)
     except Exception as exc:
         print(f"[ERROR] Failed to zip directory: {exc}")
         return
-
+    
     msg = build_submit_message(
         username    = session.username,
         exec_script = args.exec,
-        outputs     = outputs,
+        # outputs     = outputs,
         zip_bytes   = zip_bytes,
+        name        = args.job_name
     )
 
-    try:
-        send_message(session.sock, msg)
-    except OSError as exc:
-        print(f"[ERROR] Failed to send job: {exc}")
-        return
+    print(time.time())
+    session.push_msg(msg)
+
 
 def handle_stats(session: Session) -> None:
-    try:
-        send_message(session.sock, build_stats_message(session.username))
-    except OSError as exc:
-        print(f"[ERROR] {exc}")
+    session.push_msg(build_stats_message(session.username))
 
+def handle_stop(session: Session, args: argparse.Namespace) -> None:
+    session.push_msg(build_stop_message(args.job_id))
+
+def handle_output(session: Session, job_id: str) -> None:
+    session.push_msg(build_output_ack(job_id))
 
 # ---------------------------------------------------------------------------
 # Interactive REPL parser
@@ -358,29 +402,47 @@ def make_repl_parser() -> argparse.ArgumentParser:
     sub    = parser.add_subparsers(dest="command")
 
     p_submit = sub.add_parser("submit", exit_on_error=False)
-    p_submit.add_argument("--job",     required=True,
+    p_submit.add_argument("--job_dir",     required=True,
                           help="Path to the job directory")
     p_submit.add_argument("--exec",    required=True,
                           help="Entry-point script relative to the job directory root")
-    p_submit.add_argument("--outputs", nargs="*", default=[],
-                          help="Relative paths inside the job dir to retrieve on completion")
+    p_submit.add_argument("--job_name",    required=True,
+                          help="Name to identify job")
+    
 
     sub.add_parser("stats", exit_on_error=False)
+
+    p_stop = sub.add_parser("stop", exit_on_error=False)
+    p_stop.add_argument("--job_id",     required=True,
+                          help="job id from stats page")
+
     sub.add_parser("quit",  exit_on_error=False)
+
     sub.add_parser("help",  exit_on_error=False)
+
+    sub.add_parser("clear", exit_on_error=False)
 
     return parser
 
 
+# Removed: [--outputs <path> ...] [--out-dir <dir>] after <name>
+# Removed on line under Zip <dir>: --outputs lists relative paths to retrieve when done (e.g. results/ logs/out.txt).
+#     Results are extracted automatically when the coordinator pushes them back.
+
 HELP_TEXT = """\
 Commands:
-  submit --job <dir> --exec <script> [--outputs <path> ...] [--out-dir <dir>]
+  submit --job_dir <dir> --exec <script> --job_name <name> 
       Zip <dir> and submit it. --exec is the entry-point script inside the dir.
-      --outputs lists relative paths to retrieve when done (e.g. results/ logs/out.txt).
-      Results are extracted automatically when the coordinator pushes them back.
+      --job_name is a human readable way to refer to that job when stats is called
 
+  stop --job_id <job_id>
+      Stop a running job
+      
   stats
       Query job stats from the coordinator.
+
+  clear
+      Clear terminal
 
   quit
       Disconnect and exit.
@@ -401,6 +463,11 @@ def run_session(username: str) -> None:
         target=receiver_loop, args=(session,), daemon=True, name="receiver"
     )
     recv_thread.start()
+
+    send_thread = threading.Thread(
+        target=sender_loop, args=(session,), daemon=True, name="sender"
+    )
+    send_thread.start()
 
     repl_parser = make_repl_parser()
     print(HELP_TEXT)
@@ -429,6 +496,10 @@ def run_session(username: str) -> None:
             handle_submit(session, args)
         elif args.command == "stats":
             handle_stats(session)
+        elif args.command == "stop":
+            handle_stop(session, args)
+        elif args.command == "clear":
+            os.system("clear")
 
     sock.close()
 

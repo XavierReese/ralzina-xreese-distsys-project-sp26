@@ -435,8 +435,8 @@ class Worker:
                     process = subprocess.Popen(
                         ["bash", script],
                         cwd=work_dir,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
                         text=True
                     )
 
@@ -575,7 +575,7 @@ class Worker:
         
         print("[ERROR] Network error, update thread stopped")
 
-    def send_message(self, message, sock, sock_type):
+    def send_message(self, message, sock):
         # send response
         pre_response = json.dumps(message).encode("utf-8")
         response_length = len(pre_response).to_bytes(4, byteorder="big")
@@ -614,12 +614,6 @@ class Worker:
                 exit_code = job_proc.poll()
 
                 if exit_code is not None:
-                    stdout_bytes, stderr_bytes = job_proc.communicate()
-    
-                    # Convert bytes to string (handling potential empty results)
-                    stdout_text = stdout_bytes.decode('utf-8', errors='replace') if isinstance(stdout_bytes, bytes) else (stdout_bytes or "")
-                    stderr_text = stderr_bytes.decode('utf-8', errors='replace') if isinstance(stderr_bytes, bytes) else (stderr_bytes or "")
-
                     print("[OUTPUT] Process finished, sending output")
 
                     task_dir = f"{self.worker_dir}/{job_id}"

@@ -1,1 +1,0 @@
-python Worker.py --worker w$1 --max_jobs 8

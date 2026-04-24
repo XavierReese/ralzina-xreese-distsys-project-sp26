@@ -355,7 +355,7 @@ class Worker:
                 "value": "Request is not valid JSON"
             }
             with self.req_lock:
-                self.send_message(response, self.req_sock, "req_sock")
+                self.send_message(response, self.req_sock)
 
         # validate fields
 
@@ -367,7 +367,7 @@ class Worker:
                     "value": "Error message didn't include a message"
                 }
                 with self.req_lock:
-                    self.send_message(response, self.req_sock, "req_sock")
+                    self.send_message(response, self.req_sock)
             
             print(f"[ERROR] Received error from Coordinator: {request["message"]}")
         
@@ -377,7 +377,7 @@ class Worker:
                 "message": "Missing method"
             }
             with self.req_lock:
-                self.send_message(response, self.req_sock, "req_sock")
+                self.send_message(response, self.req_sock)
             return
         
         # Perform operation
@@ -420,7 +420,7 @@ class Worker:
                             "message": "Invalid zip"
                         }
                         with self.req_lock:
-                            self.send_message(response, self.req_sock, "req_sock")
+                            self.send_message(response, self.req_sock)
 
                     # This is your 'test1' or 'experiment_v2' folder
                     folder_name = extracted_items[0] 
@@ -504,7 +504,7 @@ class Worker:
             
         with self.req_lock:
             print("[NETWORK] sending message to coord")
-            self.send_message(response, self.req_sock, "req_sock")
+            self.send_message(response, self.req_sock)
         
     def invalid_args(self, args, request):
         for arg in args:
@@ -514,7 +514,7 @@ class Worker:
                     "message": f"invalid, {arg} not present"
                 }
                 with self.req_lock:
-                    self.send_message(response, self.req_sock, "req_sock")
+                    self.send_message(response, self.req_sock)
                 return True
         return False
 
@@ -564,7 +564,7 @@ class Worker:
         while not self.reset_signal.is_set():
             try:
                 with self.req_lock:
-                    self.send_message(self.get_stats(), self.req_sock, "req_sock")
+                    self.send_message(self.get_stats(), self.req_sock)
             except NetworkError:
                 self.reset_signal.set()
                 continue
@@ -630,7 +630,7 @@ class Worker:
                             "message": "Invalid zip"
                         }
                         with self.req_lock:
-                            self.send_message(response, self.req_sock, "req_sock")
+                            self.send_message(response, self.req_sock)
 
                     # This is your 'test1' or 'experiment_v2' folder
                     folder_name = extracted_items[0] 
@@ -650,7 +650,7 @@ class Worker:
 
                     # Send output
                     try:
-                        self.send_message(message, self.res_sock, "res_sock")
+                        self.send_message(message, self.res_sock)
 
                         # Receive ack
                         if not self.recv_ack(self.res_sock, "res_sock"):

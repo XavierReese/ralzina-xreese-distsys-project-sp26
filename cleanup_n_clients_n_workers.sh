@@ -15,3 +15,7 @@ done
 rm *.log
 
 rm -r coordinator_jobs
+
+rm *.txn
+
+rm *.ckpt

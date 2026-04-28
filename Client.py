@@ -2,7 +2,7 @@
 client.py  –  Interactive session client for the distributed job coordinator.
 
 Usage:
-    python client.py --name <username>
+    python client.py --name <client_id>
 
 The coordinator is discovered automatically via the ND catalog service.
 Once connected, type commands at the prompt:
@@ -118,7 +118,7 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 # - send register request
 # ---------------------------------------------------------------------------
 
-def connect_to_coordinator(username: str) -> socket.socket:
+def connect_to_coordinator(client_id: str) -> socket.socket:
     """
     Discover the coordinator, open a TCP connection, and send register request
     Retries indefinitely on failure (re-discovering via catalog each time).
@@ -132,10 +132,10 @@ def connect_to_coordinator(username: str) -> socket.socket:
             join_msg = {
                     "method": "register",
                     "type": "client",
-                    "username": username
+                    "client_id": client_id
             }
             send_message(sock, json.dumps(join_msg).encode('utf-8'))
-            print(f"[REGISTER] Requested to join coordinator as '{username}'")
+            print(f"[REGISTER] Requested to join coordinator as '{client_id}'")
             return sock
         except OSError as exc:
             print(f"[REGISTER] Connection failed ({exc}), rediscovering ...")
@@ -166,9 +166,9 @@ def zip_directory(dir_path: str) -> bytes:
 
 # Rene: I added out_dir because it wasn't defined, did you mean to pass in out_dir
 # as an arg?
-def extract_zip(zip_bytes: bytes, username: str, name: str, job_id: str) -> None:
-    os.makedirs(f'./{username}', exist_ok=True)
-    output_path = os.path.join(username, f"{name}--{job_id}")
+def extract_zip(zip_bytes: bytes, client_id: str, name: str, job_id: str) -> None:
+    os.makedirs(f'./{client_id}', exist_ok=True)
+    output_path = os.path.join(client_id, f"{name}--{job_id}")
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
         zf.extractall(output_path)
 
@@ -178,30 +178,27 @@ def extract_zip(zip_bytes: bytes, username: str, name: str, job_id: str) -> None
 # - used to build messages to be sent to coordinator
 # ---------------------------------------------------------------------------
 
-def build_submit_message(username: str,
+def build_submit_message(client_id: str,
                          exec_script: str,
                          # outputs: list[str],
                          zip_bytes: bytes,
                          name: str) -> bytes:
     message_dict = {
         "method": "submit",
-        "username": username,
+        "client_id": client_id,
         "script": exec_script,
         "name": name,
-        # "outputs": outputs,
         "zip_file": base64.b64encode(zip_bytes).decode('utf-8'),
-        "type": "client"
     }
 
     return json.dumps(message_dict).encode('utf-8')
 
 
 
-def build_stats_message(username: str) -> bytes:
+def build_stats_message(client_id: str) -> bytes:
     message_dict = {
         "method": "stats",
-        "username": username,
-        "type": "client"
+        "client_id": client_id,
     }
 
     return json.dumps(message_dict).encode('utf-8')
@@ -209,7 +206,6 @@ def build_stats_message(username: str) -> bytes:
 def build_stop_message(job_id: int) -> bytes:
     message_dict = {
             "method": "stop",
-            "type": "client",
             "job_id": job_id
     }
 
@@ -217,7 +213,6 @@ def build_stop_message(job_id: int) -> bytes:
 
 def build_output_ack(job_id: str) -> bytes:
     message_dict = {
-        "type": "client",
         "method": "ack",
         "ack_type": "output",
         "status": "ok",
@@ -239,9 +234,9 @@ class Session:
     thread knows where to extract results when a RESULT message arrives.
     """
 
-    def __init__(self, sock: socket.socket, username: str):
+    def __init__(self, sock: socket.socket, client_id: str):
         self.sock                             = sock
-        self.username                         = username
+        self.client_id                         = client_id
         self.connected                        = False
         self.send_q                           = queue.Queue()
 
@@ -289,7 +284,7 @@ def receiver_loop(session: Session) -> None:
             print(f"\n[DISCONNECTED] {exc}")
 
             session.connected = False
-            new_sock = connect_to_coordinator(session.username) # triggers retries until connected
+            new_sock = connect_to_coordinator(session.client_id) # triggers retries until connected
             session.sock = new_sock
             continue
 
@@ -320,7 +315,7 @@ def _handle_push(session: Session, message: bytes) -> None:
     elif tag == "stats":
         jobs = msg.get("message", [])
         if len(jobs) == 0:
-            print(f'[STATS] No jobs associated with user {session.username}')
+            print(f'[STATS] No jobs associated with user {session.client_id}')
         else:
             for name, status, job_id in jobs:
                 print(f'\n{name}: {status} with job_id {job_id}', end="")
@@ -337,7 +332,7 @@ def _handle_push(session: Session, message: bytes) -> None:
         if not job_id:
             print(f'[ERROR] Internal Error: No job_id provided by coordinator')
         else:
-            print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./{session.username}/{name}')
+            print(f'\r[SUBMIT] Job Submitted. When the job has completed and you are logged in, the results will be automatically downloaded to ./{session.client_id}/{name}')
     elif tag == "output":
         name = msg.get("name", "NA")
         job_id = msg["job_id"]
@@ -347,7 +342,7 @@ def _handle_push(session: Session, message: bytes) -> None:
         encoded_zip = msg["zip_bytes"]
         zip_bytes = base64.b64decode(encoded_zip)
 
-        extract_zip(zip_bytes, session.username, name, job_id)
+        extract_zip(zip_bytes, session.client_id, name, job_id)
 
         print(f"[OUTPUT] Received output from job {name}--{job_id}")
         handle_output(session, job_id)
@@ -373,9 +368,8 @@ def handle_submit(session: Session, args: argparse.Namespace) -> None:
         return
     
     msg = build_submit_message(
-        username    = session.username,
+        client_id    = session.client_id,
         exec_script = args.exec,
-        # outputs     = outputs,
         zip_bytes   = zip_bytes,
         name        = args.job_name
     )
@@ -385,7 +379,7 @@ def handle_submit(session: Session, args: argparse.Namespace) -> None:
 
 
 def handle_stats(session: Session) -> None:
-    session.push_msg(build_stats_message(session.username))
+    session.push_msg(build_stats_message(session.client_id))
 
 def handle_stop(session: Session, args: argparse.Namespace) -> None:
     session.push_msg(build_stop_message(args.job_id))
@@ -455,9 +449,9 @@ Commands:
 # - waits on client input, parses and handles commands
 # ---------------------------------------------------------------------------
 
-def run_session(username: str) -> None:
-    sock    = connect_to_coordinator(username)
-    session = Session(sock, username)
+def run_session(client_id: str) -> None:
+    sock    = connect_to_coordinator(client_id)
+    session = Session(sock, client_id)
 
     recv_thread = threading.Thread(
         target=receiver_loop, args=(session,), daemon=True, name="receiver"
@@ -512,7 +506,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="interactive client for the distributed job coordinator"
     )
-    parser.add_argument("--name", required=True, help="your username")
+    parser.add_argument("--name", required=True, help="your client_id")
     args = parser.parse_args()
 
     run_session(args.name)

@@ -96,15 +96,16 @@ class Worker:
 
         # rm -rf
         i = 0
-        while i < 5:
+        while i < 100:
             try:
                 if os.path.exists(self.worker_dir):
                     print(f"[WORKER] Detected existing workspace. Cleaning up old data...")
                     shutil.rmtree(self.worker_dir)
                 break 
             except OSError as e:
-                # Errno 39 is 'Directory not empty'
+                print("[ERROR] Couldn't delete existing directory, retrying")
                 time.sleep(0.5)
+                i += 1
                 continue
         
         if i == 5:
@@ -255,7 +256,6 @@ class Worker:
     def get_stats(self):
         stats =  {
             "method": "update",
-            "type": "worker",
             "id": self.worker_name,
             "cpu_load": self.cpu_load(),
             "free_main_mem_mb": self.free_main_mem_mb(),
@@ -364,7 +364,7 @@ class Worker:
             if "message" not in request:
                 response = {
                     "status": "error",
-                    "value": "Error message didn't include a message"
+                    "message": "Error message didn't include a message"
                 }
                 with self.req_lock:
                     self.send_message(response, self.req_sock)
@@ -387,12 +387,20 @@ class Worker:
                 if self.invalid_args(["zip_bytes", "job_id", "script"], request):
                     return
                 
-                if len(self.running_jobs) > self.max_jobs:
+                print(len(self.running_jobs), self.max_jobs)
+                if len(self.running_jobs) >= self.max_jobs:
                     response = {
                         "method": "ack",
                         "ack_type": "schedule",
-                        "status": "error"
+                        "status": "error",
+                        "message": "Worker is at full capacity",
+                        "job_id": request["job_id"]
                     }
+
+                    with self.req_lock:
+                            self.send_message(response, self.req_sock)
+                    
+                    return
 
                 zip_data = base64.b64decode(request["zip_bytes"])
                 task_dir = f"{self.worker_dir}/{request["job_id"]}"
@@ -444,13 +452,12 @@ class Worker:
                         self.running_jobs[request["job_id"]] = process 
 
                     response = {
-                        "type": "worker",
                         "method": "ack",
                         "ack_type": "schedule",
                         "status": "ok",
                         "job_id": request["job_id"]
                     }
-                    print("[ACK] Sending ack to coordinator")
+                    print("[ACK] Sending ack to coordinator for scheduled job")
                 except Exception as e:
                     response = {
                         "status": "error",
@@ -476,7 +483,6 @@ class Worker:
                     
                     response = {
                         "status": "ok",
-                        "type": "worker",
                         "method": "ack",
                         "ack_type": "stop",
                         "message": "terminated job",
@@ -547,6 +553,7 @@ class Worker:
                     
                 if response["status"] == "error":
                     print(f"[{sock_type}] ack failed")
+                    print(response)
                     return False
                 else:
                     print(f"[{sock_type}] ack to {COORDINATOR_TYPE} succeeded")
@@ -614,6 +621,10 @@ class Worker:
                 exit_code = job_proc.poll()
 
                 if exit_code is not None:
+                    # Remove job
+                    with self.jobs_lock:
+                        del self.running_jobs[job_id]
+                        
                     print("[OUTPUT] Process finished, sending output")
 
                     task_dir = f"{self.worker_dir}/{job_id}"
@@ -632,7 +643,6 @@ class Worker:
                         with self.req_lock:
                             self.send_message(response, self.req_sock)
 
-                    # This is your 'test1' or 'experiment_v2' folder
                     folder_name = extracted_items[0] 
                     work_dir = os.path.join(task_dir, folder_name)
 
@@ -641,7 +651,6 @@ class Worker:
                     encoded_bytes = base64.b64encode(zip_bytes).decode('utf-8')
 
                     message = {
-                        "type": "worker",
                         "method": "output",
                         "id": self.worker_name,
                         "job_id": job_id,
@@ -657,10 +666,6 @@ class Worker:
                             raise NetworkError("Network failed during send.")
                     except NetworkError:
                         self.reset_signal.set()
-
-                    # Remove job
-                    with self.jobs_lock:
-                        del self.running_jobs[job_id]
         
         print("[RESET] Network error, res_thread stopped")
 

@@ -1,0 +1,1 @@
+python cpu_stress.py > output.txt

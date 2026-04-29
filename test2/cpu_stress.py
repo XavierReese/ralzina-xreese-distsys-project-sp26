@@ -5,4 +5,4 @@ def cpu_stress(n):
     _ = sum(i*i for i in range(n))
     
 if __name__ == "__main__":
-    cpu_stress(500_000_000)
+    cpu_stress(10_000_000)

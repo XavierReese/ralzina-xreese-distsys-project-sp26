@@ -26,7 +26,7 @@ CATALOG_PORT = 9097
 BUFSIZ = 4096
 MAX_BACKOFF = 64
 
-MAX_LOG = 5
+MAX_LOG = 100
 
 # -------------------
 # Coordinator
@@ -116,8 +116,6 @@ class Coordinator:
 
         # Start epoll and connections
         self.connections = {}
-        self.recv_ack_worker = set()
-        self.recv_ack_client = set()
         self.epoll = select.epoll()
 
         # Catalog Update Heartbeat
@@ -233,8 +231,6 @@ class Coordinator:
 
                                             print(f"[{id}] Client {id} reconnected, sending output")
                                             self.schedule_response(result, connections[fileno], fileno)
-                                            self.recv_ack_client.add(id)
-                                            #print(f"Expecting ack from client {id}")
                             else:
                                 print("[ERROR] Error registering socket")
                                 epoll.unregister(fileno)
@@ -448,31 +444,30 @@ class Coordinator:
                             self.clear_job_queue()
 
                     case "ack":
-                        if fileno in self.recv_ack_worker:
-                            if self.invalid_args(["ack_type", "status", "job_id"], request, connection, fileno):
-                                return
+                        if self.invalid_args(["ack_type", "status", "job_id"], request, connection, fileno):
+                            return
 
-                            job_id = request.get("job_id")
-                            worker_id = connection["id"]
+                        job_id = request.get("job_id")
+                        worker_id = connection["id"]
                             
-                            if request["ack_type"] == "schedule":
-                                if request["status"] == "ok":
-                                    self.jobs[job_id]["status"] = "running"
-                                    self.workers[worker_id]["running_jobs"].add(job_id)
-                                    print(f"[{worker_id}] Received ack of scheduled job {job_id}")
-                                else:
-                                    job = self.jobs[job_id]
-                                    job["worker_id"] = None
-                                    self.schedule_job(job["client_id"], job["script"], job_id)
-                            
-                            elif request["ack_type"] == "stop":
-                                if request["status"] != "ok":
-                                    request = {
-                                        "method": "stop",
-                                        "job_id": job_id
-                                    }
+                        if request["ack_type"] == "schedule":
+                            if request["status"] == "ok":
+                                self.jobs[job_id]["status"] = "running"
+                                self.workers[worker_id]["running_jobs"].add(job_id)
+                                print(f"[{worker_id}] Received ack of scheduled job {job_id}")
+                            else:
+                                job = self.jobs[job_id]
+                                job["worker_id"] = None
+                                self.schedule_job(job["client_id"], job["script"], job_id)
+                        
+                        elif request["ack_type"] == "stop":
+                            if request["status"] != "ok":
+                                request = {
+                                    "method": "stop",
+                                    "job_id": job_id
+                                }
 
-                                    self.schedule_response(request, connection, fileno)
+                                self.schedule_response(request, connection, fileno)
 
                         else:
                             response = {
@@ -570,7 +565,6 @@ class Coordinator:
 
                         self.schedule_response(request, self.connections[worker_fd], worker_fd)
 
-                        self.recv_ack_worker.add(worker_fd)
 
                         
 
@@ -596,23 +590,21 @@ class Coordinator:
                     case "ack": # client
 
                         client_id = connection["id"]
-                        if client_id in self.recv_ack_client:
-                            if self.invalid_args(["ack_type", "status", "job_id"], request, connection, fileno):
-                                    return
+                        if self.invalid_args(["ack_type", "status", "job_id"], request, connection, fileno):
+                            return
                             
-                            job_id = request["job_id"]
+                        job_id = request["job_id"]
                             
-                            if request["ack_type"] == "output":
-                                if request["status"] != "ok":
-                                    self.send_output(job_id)
+                        if request["ack_type"] == "output":
+                            if request["status"] != "ok":
+                                self.send_output(job_id)
                                 
-                                else:
-                                    client_id = connection["id"]
-                                    print(f"[{client_id}] Received acknowledgement of output received")
-                                    self.clients[client_id]["finished_results"].remove(job_id)
-                                    del self.jobs[job_id] 
-                                    self.recv_ack_client.remove(client_id)
-                                    self._write_txn("output", job_id)
+                            else:
+                                client_id = connection["id"]
+                                print(f"[{client_id}] Received acknowledgement of output received")
+                                self.clients[client_id]["finished_results"].remove(job_id)
+                                del self.jobs[job_id] 
+                                self._write_txn("output", job_id)
 
                     case "stats":
                         if self.invalid_args(["client_id"], request, connection, fileno):
@@ -718,7 +710,6 @@ class Coordinator:
             return 
         
         print(f"[{worker_id}] Trying to schedule {job_id} in {worker_id}")
-        print(len(self.workers[worker_id]["running_jobs"]))
 
         try:
             worker_fd = self.workers[worker_id]["fileno"]
@@ -748,7 +739,6 @@ class Coordinator:
 
             print(f"[{worker_id}] Scheduling job with worker")
             self.schedule_response(request, self.connections[worker_fd], worker_fd)
-            self.recv_ack_worker.add(worker_fd)
 
             return
                 
@@ -885,7 +875,6 @@ class Coordinator:
                 "job_id": job_id
             }
 
-            self.recv_ack_client.add(client_id) 
             self.jobs[job_id]["status"] = "finished"
 
             if job_id not in self.clients[client_id]["finished_results"]:

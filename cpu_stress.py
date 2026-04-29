@@ -7,9 +7,8 @@ def cpu_stress(n):
     _ = sum(i*i for i in range(n))
     
     end_time = time.time()
-    duration = end_time - start_time
-    print(f"Job finished in {duration:.4f} seconds.")
-    return duration
+
+    print(f"Job ran from {start_time} to {end_time}")
 
 if __name__ == "__main__":
-    cpu_stress(20_000_000)
+    cpu_stress(10_000_000)

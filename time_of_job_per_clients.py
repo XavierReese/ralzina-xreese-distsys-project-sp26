@@ -33,10 +33,10 @@ def get_max_runtime():
             except Exception as e:
                 print(f"[ERROR] Could not read {filename}: {e}")
             
-            if len(individual_time) == 2:
+            if len(individual_time) >= 2:
                 start_time = min(start_time, individual_time[0])
-                end_time = max(end_time, individual_time[1])
-            total_times += 1
+                end_time = max(end_time, individual_time[-1])
+            total_times += len(individual_time) // 2
 
     print(f"{total_times} {end_time-start_time}")
 

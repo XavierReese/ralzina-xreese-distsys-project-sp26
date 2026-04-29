@@ -43,7 +43,6 @@ import argparse
 MAX_BACKOFF         = 64
 BUFSIZ              = 4096
 UPDATE_INTERVAL     = 60
-MAX_LOG_COUNT       = 100
 MAX_JOBS            = 2
 
 # Catalog constant

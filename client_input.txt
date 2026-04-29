@@ -1,1 +1,4 @@
-submit --job_dir test1 --exec test1.sh --job_name test1
+submit --job_dir test2 --exec test2.sh --job_name test2
+submit --job_dir test2 --exec test2.sh --job_name test2
+submit --job_dir test2 --exec test2.sh --job_name test2
+submit --job_dir test2 --exec test2.sh --job_name test2

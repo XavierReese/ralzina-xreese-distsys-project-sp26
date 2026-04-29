@@ -386,7 +386,6 @@ class Worker:
                 if self.invalid_args(["zip_bytes", "job_id", "script"], request):
                     return
                 
-                print(len(self.running_jobs), self.max_jobs)
                 if len(self.running_jobs) >= self.max_jobs:
                     response = {
                         "method": "ack",

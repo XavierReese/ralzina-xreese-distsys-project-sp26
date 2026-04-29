@@ -24,6 +24,7 @@ Step 3:<br>
 n refers to how many workers you want to run at the same time
 
 Step 4:<br>
+Once you finished running the programs, to clean all the created log files and directories run this program.<br>
 ```bash cleanup_n_clients_n_workers n n```<br>
 The first n is how many clients where running when you called n_clients.sh<br>
 The second n is how many workers where running when you called n_workers.sh
